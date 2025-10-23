@@ -5,7 +5,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
 from agents.matmaster_agent.constant import ModelRole
-from agents.matmaster_agent.utils import context_function_event
+from agents.matmaster_agent.utils.event_utils import context_function_event
 
 
 class HandleFileUploadLlmAgent(LlmAgent):
@@ -20,7 +20,9 @@ class HandleFileUploadLlmAgent(LlmAgent):
     """
 
     @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
         """Asynchronously process the invocation context with file upload support.
 
         Processes the user content parts, extracting text and file references to construct
@@ -39,7 +41,7 @@ class HandleFileUploadLlmAgent(LlmAgent):
             - File data parts are referenced by their file_uri in the prompt
             - Inline data parts are currently ignored
         """
-        prompt = ""
+        prompt = ''
         if ctx.user_content and ctx.user_content.parts:
             for part in ctx.user_content.parts:
                 if part.text:
@@ -50,9 +52,13 @@ class HandleFileUploadLlmAgent(LlmAgent):
                     prompt += f", file_url = {part.file_data.file_uri}"
 
                     # 包装成function_call，来避免在历史记录中展示
-                    for event in context_function_event(ctx, self.name, "system_upload_file",
-                                                        {"prompt": prompt},
-                                                        ModelRole):
+                    for event in context_function_event(
+                        ctx,
+                        self.name,
+                        'system_upload_file',
+                        {'prompt': prompt},
+                        ModelRole,
+                    ):
                         yield event
 
         # Delegate to parent implementation for the actual processing

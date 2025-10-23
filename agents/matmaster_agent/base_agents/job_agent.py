@@ -1,191 +1,88 @@
+import copy
 import json
 import logging
 import os
-from functools import wraps
-from typing import AsyncGenerator, Optional, Union, override
+from typing import AsyncGenerator, Optional, override
 
-import aiohttp
 import jsonpickle
-
-from dp.agent.adapter.adk import CalculationMCPTool
+import litellm
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
-from google.adk.agents.llm_agent import AfterToolCallback, BeforeToolCallback
 from google.adk.events import Event, EventActions
-from google.adk.tools import BaseTool, ToolContext, transfer_to_agent
-from mcp.types import CallToolResult
 from pydantic import Field
 
+from agents.matmaster_agent.base_agents.callback import (
+    _inject_ak,
+    _inject_projectId,
+    catch_after_tool_callback_error,
+    catch_before_tool_callback_error,
+    check_before_tool_callback_effect,
+    check_job_create,
+    default_after_model_callback,
+    default_after_tool_callback,
+    default_before_tool_callback,
+    inject_current_env,
+    inject_userId_sessionId,
+    inject_username_ticket,
+    remove_function_call,
+    remove_job_link,
+    tgz_oss_to_oss_list,
+)
 from agents.matmaster_agent.base_agents.io_agent import HandleFileUploadLlmAgent
-from agents.matmaster_agent.constant import OpenAPIHost, FRONTEND_STATE_KEY, Transfer2Agent, TMP_FRONTEND_STATE_KEY, \
-    LOADING_STATE_KEY, LOADING_START, LOADING_TITLE, LOADING_DESC, LOADING_END, ModelRole, JOB_LIST_KEY, \
-    get_BohriumExecutor, get_DFlowExecutor, JOB_RESULT_KEY, get_BohriumStorage
-from agents.matmaster_agent.model import BohrJobInfo, DFlowJobInfo
-from agents.matmaster_agent.prompt import SubmitRenderAgentDescription, ResultCoreAgentDescription
-from agents.matmaster_agent.utils import is_function_call, is_function_response, send_error_event, update_session_state, \
-    context_function_event, is_text, all_text_event, context_text_event, frontend_text_event, is_text_and_not_bohrium, \
-    parse_result
+from agents.matmaster_agent.constant import (
+    FRONTEND_STATE_KEY,
+    JOB_LIST_KEY,
+    JOB_RESULT_KEY,
+    LOADING_DESC,
+    LOADING_END,
+    LOADING_START,
+    LOADING_STATE_KEY,
+    LOADING_TITLE,
+    MATERIALS_ACCESS_KEY,
+    MATERIALS_PROJECT_ID,
+    SANDBOX_JOB_DETAIL_URL,
+    TMP_FRONTEND_STATE_KEY,
+    ModelRole,
+    get_BohriumExecutor,
+    get_BohriumStorage,
+    get_DFlowExecutor,
+)
+from agents.matmaster_agent.model import BohrJobInfo, DFlowJobInfo, ParamsCheckComplete
+from agents.matmaster_agent.prompt import (
+    ResultCoreAgentDescription,
+    SubmitRenderAgentDescription,
+    gen_params_check_completed_agent_instruction,
+    gen_params_check_info_agent_instruction,
+    gen_result_agent_description,
+    gen_result_core_agent_instruction,
+    gen_submit_agent_description,
+    gen_submit_core_agent_description,
+    gen_submit_core_agent_instruction,
+    gen_tool_call_info_instruction,
+)
+from agents.matmaster_agent.utils.event_utils import (
+    all_text_event,
+    cherry_pick_events,
+    context_function_event,
+    context_multipart2function_event,
+    context_text_event,
+    frontend_text_event,
+    get_function_call_indexes,
+    is_function_call,
+    is_function_response,
+    is_text,
+    send_error_event,
+    update_state_event,
+)
+from agents.matmaster_agent.utils.frontend import get_frontend_job_result_data
+from agents.matmaster_agent.utils.helper_func import (
+    get_session_state,
+    load_tool_response,
+    parse_result,
+)
+from agents.matmaster_agent.utils.io_oss import update_tgz_dict
 
 logger = logging.getLogger(__name__)
-
-
-async def default_before_tool_callback(tool, args, tool_context):
-    return
-
-
-async def default_after_tool_callback(tool, args, tool_context, tool_response):
-    return
-
-
-# 总应该在最后
-def catch_tool_call_error(func: BeforeToolCallback) -> BeforeToolCallback:
-    @wraps(func)
-    async def wrapper(tool: BaseTool, args: dict, tool_context: ToolContext) -> dict:
-        # 两步操作：
-        # 1. 调用被装饰的 before_tool_callback；
-        # 2. 如果调用的 before_tool_callback 有返回值，以这个为准
-        if (before_tool_result := await func(tool, args, tool_context)) is not None:
-            return before_tool_result
-
-        try:
-            return await tool.run_async(args=args, tool_context=tool_context)
-        except Exception as e:
-            return {
-                "error": str(e),
-                "error_type": type(e).__name__,
-            }
-
-    return wrapper
-
-
-def check_job_create(func: BeforeToolCallback) -> BeforeToolCallback:
-    @wraps(func)
-    async def wrapper(tool: BaseTool, args: dict, tool_context: ToolContext) -> Optional[dict]:
-        # 两步操作：
-        # 1. 调用被装饰的 before_tool_callback；
-        # 2. 如果调用的 before_tool_callback 有返回值，以这个为准
-        if (before_tool_result := await func(tool, args, tool_context)) is not None:
-            return before_tool_result
-
-        # 如果 tool 不是 CalculationMCPTool，不应该调用这个 callback
-        if not isinstance(tool, CalculationMCPTool):
-            return {"status": "error", "msg": "Current tool can't create job!"}
-
-        if tool.executor is not None:
-            url = f"{OpenAPIHost}/openapi/v1/job/create"
-            payload = {'projectId': int(tool_context.state['project_id']), 'name': 'check_job_create'}
-            params = {'accessKey': tool_context.state['ak']}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, params=params) as response:
-                    res = json.loads(await response.text())
-                    if res['code'] != 0:
-                        return res
-
-    return wrapper
-
-
-def _get_ak(ctx: Union[InvocationContext, ToolContext], executor, storage):
-    session_state = ctx.session.state if isinstance(ctx, InvocationContext) else ctx.state
-    access_key = session_state[FRONTEND_STATE_KEY]['biz'].get('ak', None)
-    if access_key is None:
-        access_key = os.getenv("BOHRIUM_ACCESS_KEY", None)
-    if access_key is not None:
-        if executor is not None:
-            if executor['type'] == "dispatcher":  # BohriumExecutor
-                executor['machine']['remote_profile']['access_key'] = access_key
-            elif executor["type"] == "local" and executor["dflow"]:  # DFlowExecutor
-                executor['env']['BOHRIUM_ACCESS_KEY'] = access_key
-        if storage is not None:  # BohriumStorage
-            storage['plugin']['access_key'] = access_key
-    return access_key, executor, storage
-
-
-def _get_projectId(ctx: Union[InvocationContext, ToolContext], executor, storage):
-    session_state = ctx.session.state if isinstance(ctx, InvocationContext) else ctx.state
-    project_id = session_state[FRONTEND_STATE_KEY]['biz'].get('projectId', None)
-    if project_id is None:
-        project_id = os.getenv("BOHRIUM_PROJECT_ID", None)
-    if project_id is not None:
-        if executor is not None:
-            if executor['type'] == "dispatcher":  # BohriumExecutor
-                executor['machine']['remote_profile']['project_id'] = int(project_id)
-            elif executor["type"] == "local" and executor["dflow"]:  # DFlowExecutor
-                executor['env']['BOHRIUM_PROJECT_ID'] = str(project_id)
-        if storage is not None:  # BohriumStorage
-            storage['plugin']['project_id'] = int(project_id)
-    return project_id, executor, storage
-
-
-def get_ak_projectId(func: BeforeToolCallback) -> BeforeToolCallback:
-    @wraps(func)
-    async def wrapper(tool: BaseTool, args: dict, tool_context: ToolContext) -> Optional[dict]:
-        # 两步操作：
-        # 1. 调用被装饰的 before_tool_callback；
-        # 2. 如果调用的 before_tool_callback 有返回值，以这个为准
-        if (before_tool_result := await func(tool, args, tool_context)) is not None:
-            return before_tool_result
-
-        # 如果 tool 为 Transfer2Agent，不做 ak 和 project_id 设置/校验
-        if tool.name == Transfer2Agent:
-            return None
-
-        # 如果 tool 不是 CalculationMCPTool，不应该调用这个 callback
-        if not isinstance(tool, CalculationMCPTool):
-            return {"status": "error", "msg": "Current tool does not have <storage>"}
-
-        # 获取 access_key
-        access_key, tool.executor, tool.storage = _get_ak(tool_context, tool.executor, tool.storage)
-        if access_key is None:
-            return {"status": "error", "msg": "AccessKey was not provided"}
-
-        # 获取 project_id
-        try:
-            project_id, tool.executor, tool.storage = _get_projectId(tool_context, tool.executor, tool.storage)
-        except ValueError:
-            return {"status": "error", "msg": f"ProjectId is invalid"}
-        if project_id is None:
-            return {"status": "error", "msg": "ProjectId was not provided. Please select the project first."}
-
-        tool_context.state['ak'] = access_key
-        tool_context.state['project_id'] = project_id
-
-    return wrapper
-
-
-def check_tool_response(func: AfterToolCallback) -> AfterToolCallback:
-    """A decorator that checks the tool response type before executing the callback function.
-
-    This decorator wraps an AfterToolCallback function and checks if the tool_response
-    is a dictionary. If it is, the wrapper returns None without calling the original
-    function. Otherwise, it proceeds with the original function.
-
-    Args:
-        func: The AfterToolCallback function to be wrapped.
-
-    Returns:
-        AfterToolCallback: The wrapped function that includes the type checking logic.
-
-    The wrapper function parameters:
-        tool: The BaseTool instance that was executed.
-        args: Dictionary of arguments passed to the tool.
-        tool_context: The context in which the tool was executed.
-        tool_response: The response from the tool, either a dict or CallToolResult.
-
-    Returns:
-        Optional[dict]: Returns None if tool_response is a dict, otherwise returns
-        the result of the original callback function.
-    """
-
-    @wraps(func)
-    async def wrapper(tool: BaseTool, args: dict, tool_context: ToolContext,
-                      tool_response: Union[dict, CallToolResult]) -> Optional[dict]:
-        if type(tool_response) is dict:
-            return
-
-        return await func(tool, args, tool_context, tool_response)
-
-    return wrapper
 
 
 class CalculationMCPLlmAgent(HandleFileUploadLlmAgent):
@@ -202,14 +99,41 @@ class CalculationMCPLlmAgent(HandleFileUploadLlmAgent):
         Inherits all attributes from LlmAgent.
     """
 
-    loading: bool = Field(False, description="Whether the agent is in loading state", exclude=True)
+    loading: bool = Field(
+        False, description='Whether the agent display loading state', exclude=True
+    )
+    render_tool_response: bool = Field(
+        False, description='Whether render tool response in frontend', exclude=True
+    )
+    supervisor_agent: Optional[str] = Field(
+        None, description='Which one is the supervisor_agent'
+    )
+    enable_tgz_unpack: bool = Field(
+        True, description='Whether unpack tgz files for tool_results'
+    )
 
-    def __init__(self, model, name, instruction='', description='', sub_agents=None,
-                 global_instruction='', tools=None, output_key=None,
-                 before_agent_callback=None, before_model_callback=None,
-                 before_tool_callback=default_before_tool_callback, after_tool_callback=default_after_tool_callback,
-                 after_model_callback=None, after_agent_callback=None, loading=False,
-                 disallow_transfer_to_parent=False):
+    def __init__(
+        self,
+        model,
+        name,
+        instruction='',
+        description='',
+        sub_agents=None,
+        global_instruction='',
+        tools=None,
+        output_key=None,
+        before_agent_callback=None,
+        before_model_callback=None,
+        before_tool_callback=default_before_tool_callback,
+        after_tool_callback=default_after_tool_callback,
+        after_model_callback=default_after_model_callback,
+        after_agent_callback=None,
+        loading=False,
+        render_tool_response=False,
+        disallow_transfer_to_parent=False,
+        supervisor_agent=None,
+        enable_tgz_unpack=True,
+    ):
         """Initialize a CalculationLlmAgent with enhanced tool call capabilities.
 
         Args:
@@ -238,8 +162,22 @@ class CalculationMCPLlmAgent(HandleFileUploadLlmAgent):
         """
 
         # Todo: support List[before_tool_callback]
-        before_tool_callback = catch_tool_call_error(check_job_create(get_ak_projectId(before_tool_callback)))
-        after_tool_callback = check_tool_response(after_tool_callback)
+        before_tool_callback = catch_before_tool_callback_error(
+            check_job_create(
+                inject_current_env(
+                    inject_username_ticket(
+                        inject_userId_sessionId(before_tool_callback)
+                    )
+                )
+            )
+        )
+        after_tool_callback = check_before_tool_callback_effect(
+            catch_after_tool_callback_error(
+                remove_job_link(
+                    tgz_oss_to_oss_list(after_tool_callback, enable_tgz_unpack)
+                )
+            )
+        )
 
         super().__init__(
             model=model,
@@ -256,379 +194,810 @@ class CalculationMCPLlmAgent(HandleFileUploadLlmAgent):
             after_tool_callback=after_tool_callback,
             after_model_callback=after_model_callback,
             after_agent_callback=after_agent_callback,
-            disallow_transfer_to_parent=disallow_transfer_to_parent
+            disallow_transfer_to_parent=disallow_transfer_to_parent,
+            supervisor_agent=supervisor_agent,
+            enable_tgz_unpack=enable_tgz_unpack,
         )
 
         self.loading = loading
+        self.render_tool_response = render_tool_response
+        self.supervisor_agent = supervisor_agent
+        self.enable_tgz_unpack = enable_tgz_unpack
 
     # Execution Order: user_question -> chembrain_llm -> event -> user_agree_transfer -> retrosyn_llm (param) -> event
     #                  -> user_agree_param -> retrosyn_llm (function_call) -> event -> tool_call
     #                  -> retrosyn_llm (function_response) -> event
     @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
         try:
             async for event in super()._run_async_impl(ctx):
-                if self.loading:
-                    if is_function_call(event):
-                        loading_title_msg = f"正在调用 {event.content.parts[0].function_call.name}..."
-                        loading_desc_msg = f"结果生成中，请稍等片刻..."
+                if is_function_call(event):
+                    if self.loading:
+                        loading_title_msg = (
+                            f"正在调用 {event.content.parts[0].function_call.name}..."
+                        )
+                        loading_desc_msg = '结果生成中，请稍等片刻...'
                         logger.info(loading_title_msg)
                         yield Event(
                             author=self.name,
-                            actions=EventActions(state_delta={TMP_FRONTEND_STATE_KEY: {LOADING_STATE_KEY: LOADING_START,
-                                                                                       LOADING_TITLE: loading_title_msg,
-                                                                                       LOADING_DESC: loading_desc_msg}}))
-                    elif is_function_response(event):
-                        logger.info(f"{event.content.parts[0].function_response.name} 调用结束")
+                            actions=EventActions(
+                                state_delta={
+                                    TMP_FRONTEND_STATE_KEY: {
+                                        LOADING_STATE_KEY: LOADING_START,
+                                        LOADING_TITLE: loading_title_msg,
+                                        LOADING_DESC: loading_desc_msg,
+                                    }
+                                }
+                            ),
+                        )
+                elif is_function_response(event):
+                    # Loading Event
+                    if self.loading:
+                        logger.info(
+                            f"{event.content.parts[0].function_response.name} 调用结束"
+                        )
                         yield Event(
                             author=self.name,
-                            actions=EventActions(state_delta={TMP_FRONTEND_STATE_KEY: {LOADING_STATE_KEY: LOADING_END}})
+                            actions=EventActions(
+                                state_delta={
+                                    TMP_FRONTEND_STATE_KEY: {
+                                        LOADING_STATE_KEY: LOADING_END
+                                    }
+                                }
+                            ),
                         )
-                yield event
-        except BaseExceptionGroup as err:
-            from agents.matmaster_agent.agent import (
-                root_agent as matmaster_agent,
-            )
 
-            async for error_event in send_error_event(err, ctx, self.name, matmaster_agent):
-                yield error_event
+                    # Parse Tool Response
+                    if not isinstance(self, SubmitCoreCalculationMCPLlmAgent):
+                        try:
+                            dict_result = load_tool_response(event)
+                        except BaseException:
+                            yield event
+                            raise
 
+                        job_result = await parse_result(dict_result)
+                        job_result_comp_data = get_frontend_job_result_data(job_result)
 
-class SubmitCoreCalculationMCPLlmAgent(CalculationMCPLlmAgent):
-    @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] state: {ctx.session.state}")
-
-        try:
-            async for event in super()._run_async_impl(ctx):
-                if event.long_running_tool_ids:
-                    ctx.session.state['long_running_ids'] += event.long_running_tool_ids
-                    await update_session_state(ctx, self.name)
-
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if (
-                                part
-                                and part.function_response
-                                and part.function_response.id in ctx.session.state['long_running_ids']
-                                and "result" in part.function_response.response
-                                and not part.function_response.response["result"].isError
+                        # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
+                        for system_job_result_event in context_function_event(
+                            ctx,
+                            self.name,
+                            'system_job_result',
+                            {JOB_RESULT_KEY: job_result},
+                            ModelRole,
                         ):
-                            raw_result = part.function_response.response["result"]
-                            results = json.loads(raw_result.content[0].text)
-                            origin_job_id = results["job_id"]
-                            job_name = part.function_response.name
-                            job_status = results['status']
-                            if not ctx.session.state["dflow"]:
-                                bohr_job_id = results['extra_info']["bohr_job_id"]
-                                job_detail_url = results['extra_info']['job_link']
-                                frontend_result = BohrJobInfo(origin_job_id=origin_job_id, job_name=job_name,
-                                                              job_status=job_status, job_detail_url=job_detail_url,
-                                                              job_id=bohr_job_id).model_dump(mode="json")
-                            else:
-                                workflow_id = results['extra_info']['workflow_id']
-                                workflow_uid = results['extra_info']['workflow_uid']
-                                workflow_url = results['extra_info']['workflow_link']
-                                frontend_result = DFlowJobInfo(origin_job_id=origin_job_id, job_name=job_name,
-                                                               job_status=job_status, workflow_id=workflow_id,
-                                                               workflow_uid=workflow_uid,
-                                                               workflow_url=workflow_url).model_dump(mode="json")
-                            ctx.session.state['long_running_jobs'][origin_job_id] = frontend_result
-                            ctx.session.state["render_job_list"] = True
-                            ctx.session.state["render_job_id"].append(origin_job_id)
-                            await update_session_state(ctx, self.name)
+                            yield system_job_result_event
+
+                        # Render Tool Response Event
+                        if self.render_tool_response:
+                            for result_event in all_text_event(
+                                ctx,
+                                self.name,
+                                f"<bohrium-chat-msg>{json.dumps(job_result_comp_data)}</bohrium-chat-msg>",
+                                ModelRole,
+                            ):
+                                yield result_event
 
                 # Send Normal LlmResponse to Frontend, function_call -> function_response -> Llm_response
-                if is_text(event):
-                    for function_event in context_function_event(ctx, self.name, "system_submit_core_info",
-                                                                 {"response": event.content.parts[0].text},
-                                                                 ModelRole):
-                        yield function_event
+                if isinstance(self, SubmitCoreCalculationMCPLlmAgent):
+                    yield event
+                elif is_text(event):
+                    if not event.partial:
+                        for multi_part_event in context_multipart2function_event(
+                            ctx, self.name, event, 'system_calculation_mcp_agent'
+                        ):
+                            yield multi_part_event
                 else:
                     yield event
-        except BaseExceptionGroup as err:
-            async for error_event in send_error_event(err, ctx, self.name,
-                                                      ctx.agent.parent_agent.parent_agent.parent_agent):
-                yield error_event
 
-
-class SubmitRenderAgent(LlmAgent):
-
-    def __init__(self, **kwargs):
-        super().__init__(description=SubmitRenderAgentDescription, **kwargs)
-
-    @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] state: {ctx.session.state}")
-        try:
-            async for event in super()._run_async_impl(ctx):
-                if is_text(event) and ctx.session.state["render_job_list"]:
-                    for cur_render_job_id in ctx.session.state["render_job_id"]:
-                        # Render Frontend Job-List Component
-                        job_list_comp_data = {
-                            "eventType": 1,
-                            "eventData": {
-                                "contentType": 1,
-                                "renderType": '@bohrium-chat/matmodeler/task-message',
-                                "content": {
-                                    JOB_LIST_KEY: ctx.session.state['long_running_jobs'][cur_render_job_id]
-                                },
-                            }
-                        }
-                        # 同时发送流式消息（聊条的时候可见）和数据库消息（历史记录的时候可见）
-                        for event in all_text_event(ctx=ctx,
-                                                    author=self.name,
-                                                    text=f"<bohrium-chat-msg>{json.dumps(job_list_comp_data)}</bohrium-chat-msg>",
-                                                    role=ModelRole):
-                            yield event
-
-                    ctx.session.state["render_job_list"] = False
-                    ctx.session.state["render_job_id"] = []
-                    await update_session_state(ctx, self.name)
-        except BaseExceptionGroup as err:
-            async for error_event in send_error_event(err, ctx, self.name,
-                                                      ctx.agent.parent_agent.parent_agent.parent_agent):
+            # If specified supervisor_agent, transfer back
+            if self.supervisor_agent:
+                for function_event in context_function_event(
+                    ctx,
+                    self.name,
+                    'transfer_to_agent',
+                    None,
+                    ModelRole,
+                    {'agent_name': self.supervisor_agent},
+                ):
+                    yield function_event
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
                 yield error_event
 
 
 class ResultCalculationMCPLlmAgent(CalculationMCPLlmAgent):
-
-    def __init__(self, **kwargs):
-        super().__init__(description=ResultCoreAgentDescription, **kwargs)
+    def __init__(self, enable_tgz_unpack, **kwargs):
+        super().__init__(
+            description=ResultCoreAgentDescription,
+            enable_tgz_unpack=enable_tgz_unpack,
+            **kwargs,
+        )
 
     @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] state: {ctx.session.state}")
         try:
             await self.tools[0].get_tools()
-            if not ctx.session.state["dflow"]:
-                access_key, Executor, BohriumStorge = _get_ak(ctx, get_BohriumExecutor(), get_BohriumStorage())
-                project_id, Executor, BohriumStorge = _get_projectId(ctx, Executor, BohriumStorge)
+            if not ctx.session.state['dflow']:
+                access_key, Executor, BohriumStorge = (
+                    MATERIALS_ACCESS_KEY,
+                    get_BohriumExecutor(),
+                    get_BohriumStorage(),
+                )
+                project_id, Executor, BohriumStorge = (
+                    MATERIALS_PROJECT_ID,
+                    Executor,
+                    BohriumStorge,
+                )
             else:
-                access_key, Executor, BohriumStorge = _get_ak(ctx, get_DFlowExecutor(), get_BohriumStorage())
-                project_id, Executor, BohriumStorge = _get_projectId(ctx, Executor, BohriumStorge)
+                access_key, Executor, BohriumStorge = _inject_ak(
+                    ctx, get_DFlowExecutor(), get_BohriumStorage()
+                )
+                project_id, Executor, BohriumStorge = _inject_projectId(
+                    ctx, Executor, BohriumStorge
+                )
 
             for origin_job_id in list(ctx.session.state['long_running_jobs'].keys()):
                 # 如果该任务结果已经在上下文中 && 用户没有请求这个任务结果，则不再重复查询
-                if (
-                        ctx.session.state['long_running_jobs'][origin_job_id]['job_in_ctx'] and
-                        origin_job_id != ctx.session.state[FRONTEND_STATE_KEY]["biz"].get("origin_id", None)
+                if ctx.session.state['long_running_jobs'][origin_job_id][
+                    'job_in_ctx'
+                ] and origin_job_id != ctx.session.state[FRONTEND_STATE_KEY]['biz'].get(
+                    'origin_id', None
                 ):
                     continue
 
                 if self.tools[0].query_tool is None:
-                    yield context_text_event(ctx, self.name, f"Query Tool is None, Failed", ModelRole)
+                    yield context_text_event(
+                        ctx, self.name, 'Query Tool is None, Failed', ModelRole
+                    )
                     break
 
                 query_res = await self.tools[0].query_tool.run_async(
-                    args={"job_id": origin_job_id, "executor": Executor}, tool_context=None)
+                    args={'job_id': origin_job_id, 'executor': Executor},
+                    tool_context=None,
+                )
                 if query_res.isError:
                     logger.error(query_res.content[0].text)
-                    continue
+                    raise RuntimeError(query_res.content[0].text)
                 status = query_res.content[0].text
-                if status != "Running":
-                    ctx.session.state['long_running_jobs'][origin_job_id]['job_status'] = status
+                logger.info(
+                    f'[ResultCalculationMCPLlmAgent] origin_job_id = {origin_job_id}, executor = {Executor}, '
+                    f'status = {status}'
+                )
+                if status != 'Running':
+                    ctx.session.state['long_running_jobs'][origin_job_id][
+                        'job_status'
+                    ] = status
                     results_res = await self.tools[0].results_tool.run_async(
-                        args={"job_id": origin_job_id, "executor": Executor, "storage": BohriumStorge},
-                        tool_context=None)
-                    if results_res.isError:  # Job Failed
+                        args={
+                            'job_id': origin_job_id,
+                            'executor': Executor,
+                            'storage': BohriumStorge,
+                        },
+                        tool_context=None,
+                    )
+                    if results_res.isError:  # Job Result Retrival Failed
                         err_msg = results_res.content[0].text
-                        if err_msg.startswith("Error executing tool"):
-                            err_msg = err_msg[err_msg.find(":") + 2:]
-                        yield frontend_text_event(ctx, self.name, f"Job {origin_job_id} failed: {err_msg}",
-                                                  ModelRole)
+                        if err_msg.startswith('Error executing tool'):
+                            err_msg = err_msg[err_msg.find(':') + 2 :]
+                        yield frontend_text_event(
+                            ctx,
+                            self.name,
+                            f"Job {origin_job_id} failed: {err_msg}",
+                            ModelRole,
+                        )
+                    elif status == 'Failed':  # Job Failed
+                        pass
                     else:  # Job Success
                         raw_result = results_res.content[0].text
                         dict_result = jsonpickle.loads(raw_result)
-                        ctx.session.state['long_running_jobs'][origin_job_id]['job_result'] = await parse_result(
-                            dict_result)
+                        logger.info(
+                            f"[ResultCalculationMCPLlmAgent] dict_result = {dict_result}"
+                        )
 
-                        # Render Frontend Job-Result Component
-                        job_result_comp_data = {
-                            "eventType": 1,
-                            "eventData": {
-                                "contentType": 1,
-                                "renderType": '@bohrium-chat/matmodeler/dialog-file',
-                                "content": {
-                                    JOB_RESULT_KEY: ctx.session.state['long_running_jobs'][origin_job_id][
-                                        'job_result']
-                                },
-                            }
-                        }
+                        if self.enable_tgz_unpack:
+                            tgz_flag, new_tool_result = await update_tgz_dict(
+                                dict_result
+                            )
+                        else:
+                            new_tool_result = dict_result
+                        ctx.session.state['long_running_jobs'][origin_job_id][
+                            'job_result'
+                        ] = await parse_result(new_tool_result)
+                        job_result_comp_data = get_frontend_job_result_data(
+                            ctx.session.state['long_running_jobs'][origin_job_id][
+                                'job_result'
+                            ]
+                        )
 
                         # Only for debug
-                        if os.getenv("MODE", None) == "debug":
-                            ctx.session.state[FRONTEND_STATE_KEY]["biz"]["origin_id"] = origin_job_id
+                        if os.getenv('MODE', None) == 'debug':
+                            ctx.session.state[FRONTEND_STATE_KEY]['biz'][
+                                'origin_id'
+                            ] = origin_job_id
 
                         # 如果用户请求这个id的任务结果，渲染前端组件
-                        if origin_job_id == ctx.session.state[FRONTEND_STATE_KEY]["biz"].get("origin_id", None):
-                            for event in all_text_event(ctx,
-                                                        self.name,
-                                                        f"<bohrium-chat-msg>{json.dumps(job_result_comp_data)}</bohrium-chat-msg>",
-                                                        ModelRole):
+                        if origin_job_id == ctx.session.state[FRONTEND_STATE_KEY][
+                            'biz'
+                        ].get('origin_id', None):
+                            for event in all_text_event(
+                                ctx,
+                                self.name,
+                                f"<bohrium-chat-msg>{json.dumps(job_result_comp_data)}</bohrium-chat-msg>",
+                                ModelRole,
+                            ):
                                 yield event
 
                             # Only for debug
-                            if os.getenv("MODE", None) == "debug":
-                                ctx.session.state[FRONTEND_STATE_KEY]["biz"]["origin_id"] = None
+                            if os.getenv('MODE', None) == 'debug':
+                                ctx.session.state[FRONTEND_STATE_KEY]['biz'][
+                                    'origin_id'
+                                ] = None
 
                         # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
-                        for event in context_function_event(ctx, self.name, "system_job_result",
-                                                            job_result_comp_data['eventData']['content'],
-                                                            ModelRole):
+                        for event in context_function_event(
+                            ctx,
+                            self.name,
+                            'system_job_result',
+                            {
+                                JOB_RESULT_KEY: ctx.session.state['long_running_jobs'][
+                                    origin_job_id
+                                ]['job_result']
+                            },
+                            ModelRole,
+                        ):
                             yield event
 
-                        ctx.session.state['long_running_jobs'][origin_job_id]['job_in_ctx'] = True
-                    await update_session_state(ctx, self.name)
-
+                    update_long_running_jobs = copy.deepcopy(
+                        ctx.session.state['long_running_jobs']
+                    )
+                    update_long_running_jobs[origin_job_id]['job_in_ctx'] = True
+                    yield update_state_event(
+                        ctx,
+                        state_delta={'long_running_jobs': update_long_running_jobs},
+                    )
                 # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
-                for event in context_function_event(ctx, self.name, "system_job_status",
-                                                    {"msg": f"Job {origin_job_id} status is {status}"},
-                                                    ModelRole):
+                for event in context_function_event(
+                    ctx,
+                    self.name,
+                    'system_job_status',
+                    {'msg': f"Job {origin_job_id} status is {status}"},
+                    ModelRole,
+                ):
                     yield event
-
-        except BaseExceptionGroup as err:
-            async for error_event in send_error_event(err, ctx, self.name,
-                                                      ctx.agent.parent_agent.parent_agent.parent_agent):
+            yield Event(author=self.name)
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
                 yield error_event
 
 
-class ResultTransferLlmAgent(LlmAgent):
+class ParamsCheckCompletedAgent(LlmAgent):
+    pass
+
+
+class ParamsCheckInfoAgent(LlmAgent):
     @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        async for event in super()._run_async_impl(ctx):
-            # Send Normal LlmResponse to Frontend, function_call -> function_response -> Llm_response
-            if is_text_and_not_bohrium(event):
-                for function_event in context_function_event(ctx, self.name,
-                                                             "system_result_transfer_info",
-                                                             {"response": event.content.parts[0].text},
-                                                             ModelRole):
-                    yield function_event
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        try:
+            async for event in super()._run_async_impl(ctx):
+                # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
+                if not event.partial:
+                    for system_job_result_event in context_function_event(
+                        ctx,
+                        self.name,
+                        'system_params_check',
+                        {'msg': event.content.parts[0].text},
+                        ModelRole,
+                    ):
+                        yield system_job_result_event
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
+                yield error_event
+
+
+class ToolCallInfoAgent(LlmAgent):
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        try:
+            async for event in super()._run_async_impl(ctx):
+                # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
+                if not event.partial:
+                    try:
+                        tool_call_info = json.loads(event.content.parts[0].text)
+                    except BaseException:
+                        logger.info(
+                            f'[ToolCallInfoAgent] raw_text = {event.content.parts[0].text}'
+                        )
+                        raise
+                    for system_job_result_event in context_function_event(
+                        ctx,
+                        self.name,
+                        'system_tool_call_info',
+                        tool_call_info,
+                        ModelRole,
+                    ):
+                        yield system_job_result_event
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
+                yield error_event
+
+
+class SubmitCoreCalculationMCPLlmAgent(CalculationMCPLlmAgent):
+    def __init__(self, enable_tgz_unpack, **kwargs):
+        super().__init__(enable_tgz_unpack=enable_tgz_unpack, **kwargs)
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] state: {ctx.session.state}")
+
+        try:
+            async for event in super()._run_async_impl(ctx):
+                # Only For Sync Tool Call
+                if (
+                    is_function_call(event)
+                    and ctx.session.state['sync_tools']
+                    and (function_indexes := get_function_call_indexes(event))
+                    and event.content.parts[function_indexes[0]].function_call.name
+                    in ctx.session.state['sync_tools']
+                ):
+                    event.long_running_tool_ids = None  # Untag Async Job
+                    yield update_state_event(
+                        ctx,
+                        state_delta={
+                            'long_running_jobs_count': ctx.session.state[
+                                'long_running_jobs_count'
+                            ]
+                            + 1
+                        },
+                    )
+
+                if (
+                    is_function_response(event)
+                    and ctx.session.state['sync_tools']
+                    and event.content.parts[0].function_response.name
+                    in ctx.session.state['sync_tools']
+                ):
+                    try:
+                        dict_result = load_tool_response(event)
+                    except BaseException:
+                        yield event
+                        raise
+
+                    if self.enable_tgz_unpack:
+                        tgz_flag, new_tool_result = await update_tgz_dict(dict_result)
+                    else:
+                        new_tool_result = dict_result
+                    parsed_result = await parse_result(new_tool_result)
+                    job_result_comp_data = get_frontend_job_result_data(parsed_result)
+
+                    for frontend_job_result_event in all_text_event(
+                        ctx,
+                        self.name,
+                        f"<bohrium-chat-msg>{json.dumps(job_result_comp_data)}</bohrium-chat-msg>",
+                        ModelRole,
+                    ):
+                        yield frontend_job_result_event
+
+                    # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
+                    for db_job_result_event in context_function_event(
+                        ctx,
+                        self.name,
+                        'system_job_result',
+                        {JOB_RESULT_KEY: parsed_result},
+                        ModelRole,
+                    ):
+                        yield db_job_result_event
+                # END
+
+                # Only for Long Running Tools Call
+                if event.long_running_tool_ids:
+                    yield update_state_event(
+                        ctx,
+                        state_delta={
+                            'long_running_ids': ctx.session.state['long_running_ids']
+                            + list(event.long_running_tool_ids)
+                        },
+                    )
+
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if (
+                            part
+                            and part.function_response
+                            and part.function_response.id
+                            in ctx.session.state['long_running_ids']
+                            and 'result' in part.function_response.response
+                        ):
+                            if not part.function_response.response['result'].isError:
+                                raw_result = part.function_response.response['result']
+                                results = json.loads(raw_result.content[0].text)
+                                logger.info(
+                                    f"[SubmitCoreCalculationMCPLlmAgent] results = {results}"
+                                )
+                                origin_job_id = results['job_id']
+                                job_name = part.function_response.name
+                                job_status = results['status']
+                                if not ctx.session.state['dflow']:
+                                    bohr_job_id = results['extra_info']['bohr_job_id']
+                                    job_detail_url = (
+                                        f'{SANDBOX_JOB_DETAIL_URL}/{bohr_job_id}'
+                                    )
+                                    frontend_result = BohrJobInfo(
+                                        origin_job_id=origin_job_id,
+                                        job_name=job_name,
+                                        job_status=job_status,
+                                        job_id=bohr_job_id,
+                                        job_detail_url=job_detail_url,
+                                        agent_name=ctx.agent.parent_agent.parent_agent.name,
+                                    ).model_dump(mode='json')
+                                else:
+                                    workflow_id = results['extra_info']['workflow_id']
+                                    workflow_uid = results['extra_info']['workflow_uid']
+                                    workflow_url = results['extra_info'][
+                                        'workflow_link'
+                                    ]
+                                    frontend_result = DFlowJobInfo(
+                                        origin_job_id=origin_job_id,
+                                        job_name=job_name,
+                                        job_status=job_status,
+                                        workflow_id=workflow_id,
+                                        workflow_uid=workflow_uid,
+                                        workflow_url=workflow_url,
+                                    ).model_dump(mode='json')
+
+                                update_long_running_jobs = copy.deepcopy(
+                                    ctx.session.state['long_running_jobs']
+                                )
+                                update_long_running_jobs[origin_job_id] = (
+                                    frontend_result
+                                )
+                                yield update_state_event(
+                                    ctx,
+                                    state_delta={
+                                        'long_running_jobs': update_long_running_jobs,
+                                        'render_job_list': True,
+                                        'render_job_id': ctx.session.state[
+                                            'render_job_id'
+                                        ]
+                                        + [origin_job_id],
+                                        'long_running_jobs_count': ctx.session.state[
+                                            'long_running_jobs_count'
+                                        ]
+                                        + 1,
+                                    },
+                                )
+                            else:
+                                # 提交报错同样+1，避免幻觉 card
+                                yield update_state_event(
+                                    ctx,
+                                    state_delta={
+                                        'long_running_jobs_count': ctx.session.state[
+                                            'long_running_jobs_count'
+                                        ]
+                                        + 1,
+                                    },
+                                )
+                # END
+
+                # Send Normal LlmResponse to Frontend, function_call -> function_response -> Llm_response
+                if is_text(event):
+                    if not event.partial:
+                        for multi_part_event in context_multipart2function_event(
+                            ctx, self.name, event, 'system_submit_core_info'
+                        ):
+                            yield multi_part_event
+                else:
+                    yield event
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
+                yield error_event
+
+
+class SubmitRenderAgent(LlmAgent):
+    def __init__(self, **kwargs):
+        super().__init__(description=SubmitRenderAgentDescription, **kwargs)
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] state: {ctx.session.state}")
+        try:
+            async for event in super()._run_async_impl(ctx):
+                if is_text(event) and ctx.session.state['render_job_list']:
+                    for cur_render_job_id in ctx.session.state['render_job_id']:
+                        # Render Frontend Job-List Component
+                        job_list_comp_data = {
+                            'eventType': 1,
+                            'eventData': {
+                                'contentType': 1,
+                                'renderType': '@bohrium-chat/matmodeler/task-message',
+                                'content': {
+                                    JOB_LIST_KEY: ctx.session.state[
+                                        'long_running_jobs'
+                                    ][cur_render_job_id]
+                                },
+                            },
+                        }
+                        if not ctx.session.state['dflow']:
+                            # 同时发送流式消息（聊条的时候可见）和数据库消息（历史记录的时候可见）
+                            for event in all_text_event(
+                                ctx=ctx,
+                                author=self.name,
+                                text=f"<bohrium-chat-msg>{json.dumps(job_list_comp_data)}</bohrium-chat-msg>",
+                                role=ModelRole,
+                            ):
+                                yield event
+
+                    yield update_state_event(
+                        ctx, state_delta={'render_job_list': False, 'render_job_id': []}
+                    )
+        except BaseException as err:
+            async for error_event in send_error_event(err, ctx, self.name):
+                yield error_event
+
+
+class SubmitValidatorAgent(LlmAgent):
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        if ctx.session.state['error_occurred']:
+            return
+
+        if (
+            ctx.session.state['long_running_jobs_count']
+            > ctx.session.state['long_running_jobs_count_ori']
+        ):
+            submit_validator_msg = 'The Job has indeed been submitted.'
+            yield update_state_event(
+                ctx,
+                state_delta={
+                    'long_running_jobs_count_ori': ctx.session.state[
+                        'long_running_jobs_count'
+                    ]
+                },
+            )
+        else:
+            submit_validator_msg = (
+                'System is experiencing task submission hallucination; '
+                'I recommend retrying with the original parameters.'
+            )
+
+            current_agent = ctx.agent.parent_agent.parent_agent.name
+            if ctx.session.state['hallucination_agent'] != current_agent:
+                yield update_state_event(
+                    ctx,
+                    state_delta={
+                        'hallucination': True,
+                        'hallucination_agent': ctx.agent.parent_agent.parent_agent.name,
+                    },
+                )
             else:
-                yield event
+                yield update_state_event(
+                    ctx,
+                    state_delta={
+                        'hallucination_agent': None,
+                    },
+                )
+        logger.info(f'[SubmitValidatorAgent] state = {ctx.session.state}')
+
+        for function_event in context_function_event(
+            ctx,
+            self.name,
+            'system_submit_validator',
+            {'msg': submit_validator_msg},
+            ModelRole,
+        ):
+            yield function_event
 
 
 class BaseAsyncJobAgent(LlmAgent):
     submit_agent: SequentialAgent
     result_agent: SequentialAgent
-    # transfer_agent: LlmAgent
-    dflow_flag: False = Field(False, description="Whether the agent is dflow related", exclude=True)
+    params_check_info_agent: LlmAgent
+    tool_call_info_agent: LlmAgent
+    dflow_flag: bool = Field(
+        False, description='Whether the agent is dflow related', exclude=True
+    )
     supervisor_agent: str
+    sync_tools: Optional[list] = Field(
+        None, description='These tools will sync run on the server'
+    )
+    enable_tgz_unpack: bool = Field(
+        True, description='Whether unpack tgz files for tool_results'
+    )
 
     def __init__(
-            self,
-            model,
-            agent_name: str,
-            agent_description: str,
-            agent_instruction: str,
-            submit_core_agent_class,
-            submit_core_agent_name: str,
-            submit_core_agent_description: str,
-            submit_core_agent_instruction: str,
-            mcp_tools: list,
-            submit_render_agent_name: str,
-            result_core_agent_class,
-            result_core_agent_name: str,
-            result_core_agent_instruction: str,
-            result_transfer_agent_name: str,
-            result_transfer_agent_instruction: str,
-            transfer_agent_name: str,
-            transfer_agent_instruction: str,
-            submit_agent_name: str,
-            submit_agent_description: str,
-            result_agent_name: str,
-            result_agent_description: str,
-            dflow_flag: bool,
-            supervisor_agent: str
+        self,
+        model,
+        agent_name: str,
+        agent_description: str,
+        agent_instruction: str,
+        mcp_tools: list,
+        dflow_flag: bool,
+        supervisor_agent: str,
+        sync_tools: Optional[list] = None,
+        enable_tgz_unpack: bool = True,
     ):
+        agent_prefix = agent_name.replace('_agent', '')
+
         # 创建提交核心代理
-        submit_core_agent = submit_core_agent_class(
+        submit_core_agent = SubmitCoreCalculationMCPLlmAgent(
             model=model,
-            name=submit_core_agent_name,
-            description=submit_core_agent_description,
-            instruction=submit_core_agent_instruction,
+            name=f"{agent_prefix}_submit_core_agent",
+            description=gen_submit_core_agent_description(agent_prefix),
+            instruction=gen_submit_core_agent_instruction(agent_prefix),
             tools=mcp_tools,
-            disallow_transfer_to_parent=True
+            disallow_transfer_to_parent=True,
+            enable_tgz_unpack=enable_tgz_unpack,
         )
 
         # 创建提交渲染代理
         submit_render_agent = SubmitRenderAgent(
-            model=model,
-            name=submit_render_agent_name
+            model=model, name=f"{agent_prefix}_submit_render_agent"
+        )
+
+        submit_validator_agent = SubmitValidatorAgent(
+            model=model, name=f"{agent_prefix}_submit_validator_agent"
         )
 
         # 创建提交序列代理
         submit_agent = SequentialAgent(
-            name=submit_agent_name,
-            description=submit_agent_description,
-            sub_agents=[submit_core_agent, submit_render_agent]
+            name=f"{agent_prefix}_submit_agent",
+            description=gen_submit_agent_description(agent_prefix),
+            sub_agents=[submit_core_agent, submit_render_agent, submit_validator_agent],
         )
 
         # 创建结果核心代理
-        result_core_agent = result_core_agent_class(
+        result_core_agent = ResultCalculationMCPLlmAgent(
             model=model,
-            name=result_core_agent_name,
+            name=f"{agent_prefix}_result_core_agent",
             tools=mcp_tools,
-            instruction=result_core_agent_instruction
-        )
-
-        # 创建结果转移代理
-        result_transfer_agent = ResultTransferLlmAgent(
-            model=model,
-            name=result_transfer_agent_name,
-            instruction=result_transfer_agent_instruction,
-            tools=[transfer_to_agent]
+            instruction=gen_result_core_agent_instruction(agent_prefix),
+            enable_tgz_unpack=enable_tgz_unpack,
         )
 
         # 创建结果序列代理
         result_agent = SequentialAgent(
-            name=result_agent_name,
-            description=result_agent_description,
-            sub_agents=[result_core_agent, result_transfer_agent]
-            # sub_agents=[result_core_agent]
+            name=f"{agent_prefix}_result_agent",
+            description=gen_result_agent_description(),
+            sub_agents=[result_core_agent],
         )
 
-        # # 创建转移代理
-        # transfer_agent = LlmAgent(
-        #     model=llm_config.gpt_4o,
-        #     name=transfer_agent_name,
-        #     description=TransferAgentDescription,
-        #     instruction=transfer_agent_instruction
-        # )
+        params_check_info_agent = ParamsCheckInfoAgent(
+            model=model,
+            name=f"{agent_prefix}_params_check_info_agent",
+            instruction=gen_params_check_info_agent_instruction(),
+            tools=mcp_tools,
+            disallow_transfer_to_parent=True,
+            disallow_transfer_to_peers=True,
+            after_model_callback=remove_function_call,
+        )
+
+        tool_call_info_agent = ToolCallInfoAgent(
+            model=model,
+            name=f"{agent_prefix}_tool_call_info_agent",
+            instruction=gen_tool_call_info_instruction(),
+            tools=mcp_tools,
+            disallow_transfer_to_parent=True,
+            disallow_transfer_to_peers=True,
+            after_model_callback=remove_function_call,
+        )
 
         # 初始化父类
         super().__init__(
             name=agent_name,
             model=model,
             description=agent_description,
-            instruction=agent_instruction,
             submit_agent=submit_agent,
             result_agent=result_agent,
-            # transfer_agent=transfer_agent,
+            params_check_info_agent=params_check_info_agent,
+            tool_call_info_agent=tool_call_info_agent,
             dflow_flag=dflow_flag,
-            # sub_agents=[submit_agent, result_agent, transfer_agent],
-            sub_agents=[submit_agent, result_agent],
-            supervisor_agent=supervisor_agent
+            sub_agents=[
+                submit_agent,
+                result_agent,
+                params_check_info_agent,
+                tool_call_info_agent,
+            ],
+            supervisor_agent=supervisor_agent,
+            sync_tools=sync_tools,
+            enable_tgz_unpack=enable_tgz_unpack,
         )
 
     @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        ctx.session.state["dflow"] = self.dflow_flag
-        await update_session_state(ctx, self.name)
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        session_state = get_session_state(ctx)
+        yield update_state_event(
+            ctx, state_delta={'dflow': self.dflow_flag, 'sync_tools': self.sync_tools}
+        )
 
-        if ctx.session.state[FRONTEND_STATE_KEY]["biz"].get("origin_id", None) is not None:
-            async for result_event in self.result_agent.run_async(ctx):
-                yield result_event
+        async for result_event in self.result_agent.run_async(ctx):
+            yield result_event
+
+        if session_state.get('origin_job_id', None) is not None or (
+            session_state[FRONTEND_STATE_KEY]['biz'].get('origin_id', None) is not None
+            and list(session_state['long_running_jobs'].keys())
+            and session_state[FRONTEND_STATE_KEY]['biz']['origin_id']
+            in list(session_state['long_running_jobs'].keys())
+        ):  # Only Query Job Result
+            pass
         else:
-            async for result_event in self.result_agent.run_async(ctx):
-                yield result_event
+            cherry_pick_parts = cherry_pick_events(ctx)[-5:]
+            context_messages = '\n'.join(
+                [
+                    f'<{item[0].title()}> said: \n{item[1]}\n'
+                    for item in cherry_pick_parts
+                ]
+            )
+            logger.info(f"[BaseAsyncJobAgent] context_messages = {context_messages}")
 
-            async for submit_event in self.submit_agent.run_async(ctx):
-                yield submit_event
+            prompt = gen_params_check_completed_agent_instruction().format(
+                context_messages=context_messages
+            )
+            response = litellm.completion(
+                model='azure/gpt-4o',
+                messages=[{'role': 'user', 'content': prompt}],
+                response_format=ParamsCheckComplete,
+            )
+            params_check_completed_json: dict = json.loads(
+                response.choices[0].message.content
+            )
+            logger.info(
+                f"[BaseAsyncJobAgent] params_check_completed_json = {params_check_completed_json}"
+            )
+            params_check_completed = params_check_completed_json['flag']
+            params_check_reason = params_check_completed_json['reason']
+            params_check_msg = params_check_completed_json['analyzed_messages']
 
-            # async for transfer_event in self.transfer_agent.run_async(ctx):
-            #     yield transfer_event
+            # 包装成function_call，来避免在历史记录中展示；同时模型可以在上下文中感知
+            for params_check_reason_event in context_function_event(
+                ctx,
+                self.name,
+                'system_params_check_result',
+                {
+                    'complete': params_check_completed,
+                    'reason': params_check_reason,
+                    'analyzed_messages': params_check_msg,
+                },
+                ModelRole,
+            ):
+                yield params_check_reason_event
 
-        for function_event in context_function_event(ctx, self.name, "transfer_to_agent", None, ModelRole,
-                                                     {"agent_name": self.supervisor_agent}):
+            if not params_check_completed:
+                # Call ParamsCheckInfoAgent to generate params needing check
+                async for (
+                    params_check_info_event
+                ) in self.params_check_info_agent.run_async(ctx):
+                    yield params_check_info_event
+            else:
+                async for tool_call_info_event in self.tool_call_info_agent.run_async(
+                    ctx
+                ):
+                    yield tool_call_info_event
+                async for submit_event in self.submit_agent.run_async(ctx):
+                    yield submit_event
+
+        for function_event in context_function_event(
+            ctx,
+            self.name,
+            'transfer_to_agent',
+            None,
+            ModelRole,
+            {'agent_name': self.supervisor_agent},
+        ):
             yield function_event
