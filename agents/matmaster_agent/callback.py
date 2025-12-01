@@ -11,11 +11,17 @@ from google.adk.models import LlmResponse
 from google.genai import types
 from google.genai.types import FunctionCall, Part
 
-from agents.matmaster_agent.constant import FRONTEND_STATE_KEY, MATERIALS_ACCESS_KEY
+from agents.matmaster_agent.constant import (
+    FRONTEND_STATE_KEY,
+    MATERIALS_ACCESS_KEY,
+    MATMASTER_AGENT_NAME,
+)
 from agents.matmaster_agent.locales import i18n
 from agents.matmaster_agent.model import UserContent
 from agents.matmaster_agent.prompt import get_user_content_lang
+from agents.matmaster_agent.services.quota import check_quota_service, use_quota_service
 from agents.matmaster_agent.style import get_job_complete_card, hallucination_card
+from agents.matmaster_agent.utils.helper_func import get_user_id
 from agents.matmaster_agent.utils.job_utils import (
     get_job_status,
     get_running_jobs_detail,
@@ -23,12 +29,17 @@ from agents.matmaster_agent.utils.job_utils import (
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # before_agent_callback
 async def matmaster_prepare_state(
     callback_context: CallbackContext,
 ) -> Optional[types.Content]:
+    session_id = callback_context.session.id
+    logger.info(
+        f'[{MATMASTER_AGENT_NAME}] {session_id} state = {callback_context.state.to_dict()}'
+    )
     callback_context.state['current_time'] = datetime.now().strftime(
         '%Y-%m-%d %H:%M:%S'
     )
@@ -69,7 +80,7 @@ async def matmaster_prepare_state(
         'sync_tools', None
     )
     callback_context.state['invocation_id_with_tool_call'] = callback_context.state.get(
-        'invocation_id_with_tool_call', None
+        'invocation_id_with_tool_call', {}
     )
     callback_context.state['last_llm_response_partial'] = callback_context.state.get(
         'last_llm_response_partial', None
@@ -77,11 +88,50 @@ async def matmaster_prepare_state(
     callback_context.state['new_query_job_status'] = callback_context.state.get(
         'new_query_job_status', {}
     )
+    callback_context.state['cost'] = callback_context.state.get('cost', {})
     callback_context.state['hallucination'] = callback_context.state.get(
         'hallucination', False
     )
     callback_context.state['hallucination_agent'] = callback_context.state.get(
         'hallucination_agent', None
+    )
+    callback_context.state['tools_count'] = callback_context.state.get('tools_count', 0)
+    callback_context.state['tools_count_ori'] = callback_context.state.get(
+        'tools_count_ori', 0
+    )
+    callback_context.state['tool_hallucination'] = callback_context.state.get(
+        'tool_hallucination', False
+    )
+    callback_context.state['tool_hallucination_agent'] = callback_context.state.get(
+        'tool_hallucination_agent', None
+    )
+    callback_context.state['plan'] = callback_context.state.get('plan', None)
+    callback_context.state['plan_index'] = callback_context.state.get(
+        'plan_index', None
+    )
+    callback_context.state['tool_call_info'] = callback_context.state.get(
+        'tool_call_info', {}
+    )
+    callback_context.state['update_tool_args'] = callback_context.state.get(
+        'update_tool_args', {}
+    )
+    # 用户是否确认计划方案
+    callback_context.state['plan_confirm'] = callback_context.state.get(
+        'plan_confirm', {}
+    )
+    # 用户意图
+    callback_context.state['intent'] = callback_context.state.get('intent', {})
+    # 函数签名 From Server
+    callback_context.state['function_declarations'] = callback_context.state.get(
+        'function_declarations', {}
+    )
+    # 单次计划涉及的所有场景
+    callback_context.state['scenes'] = callback_context.state.get('scenes', [])
+    # 单次计划涉及的所有场景
+    callback_context.state['upload_file'] = False
+    # 用户免费使用次数
+    callback_context.state['quota_remaining'] = callback_context.state.get(
+        'quota_remaining', None
     )
 
 
@@ -95,8 +145,13 @@ async def matmaster_set_lang(
         messages=[{'role': 'user', 'content': prompt}],
         response_format=UserContent,
     )
-    result: dict = json.loads(response.choices[0].message.content)
-    logger.info(f"[{inspect.currentframe().f_code.co_name}] result = {result}")
+    try:
+        result: dict = json.loads(response.choices[0].message.content)
+    except BaseException:
+        result = {}
+    logger.info(
+        f"[{MATMASTER_AGENT_NAME}]:[{inspect.currentframe().f_code.co_name}] result = {result}"
+    )
     language = str(result.get('language', 'zh'))
     callback_context.state['target_language'] = language
     if callback_context.state['target_language'] in [
@@ -108,6 +163,18 @@ async def matmaster_set_lang(
         i18n.language = 'zh'
     else:
         i18n.language = 'en'
+
+
+async def matmaster_check_quota(
+    callback_context: CallbackContext,
+) -> Optional[types.Content]:
+    user_id = get_user_id(callback_context)
+    response = await check_quota_service(user_id=user_id)
+    logger.info(f'{callback_context.session.id} check_quota_response = {response}')
+    if not response['data'].get('remaining') or not response['data']['remaining']:
+        callback_context.state['quota_remaining'] = 0
+    else:
+        callback_context.state['quota_remaining'] = response['data']['remaining']
 
 
 # after_model_callback
@@ -132,7 +199,7 @@ async def matmaster_check_job_status(
         for origin_job_id, job_id, agent_name in running_job_ids:
             if not callback_context.state['last_llm_response_partial']:
                 logger.info(
-                    '[matmaster_check_job_status] new LlmResponse, prepare call API'
+                    f'[{MATMASTER_AGENT_NAME}]:[matmaster_check_job_status] new LlmResponse, prepare call API'
                 )
                 job_status = await get_job_status(
                     job_id, access_key=MATERIALS_ACCESS_KEY
@@ -145,7 +212,7 @@ async def matmaster_check_job_status(
                     'origin_job_id'
                 ]  # 从 state 里取
             logger.info(
-                f"[matmaster_check_job_status] last_llm_response_partial = "
+                f"[{MATMASTER_AGENT_NAME}]:[matmaster_check_job_status] last_llm_response_partial = "
                 f"{callback_context.state['last_llm_response_partial']}, "
                 f"job_id = {job_id}, job_status = {job_status}"
             )
@@ -184,11 +251,13 @@ async def matmaster_hallucination_retry(
 ) -> Optional[LlmResponse]:
     hallucination_flag = callback_context.state['hallucination']
     hallucination_agent = callback_context.state['hallucination_agent']
-    logger.info(
-        f'[matmaster_hallucination_retry] hallucination_flag={hallucination_flag}, hallucination_agent={hallucination_agent}, i18n.language = {i18n.language}'
-    )
+
     if not callback_context.state['hallucination']:
         return
+
+    logger.info(
+        f'[{MATMASTER_AGENT_NAME}] hallucination_flag={hallucination_flag}, hallucination_agent={hallucination_agent}, i18n.language = {i18n.language}'
+    )
 
     if llm_response.partial:  # 原来消息的流式版本置空 None
         llm_response.content = None
@@ -212,3 +281,13 @@ async def matmaster_hallucination_retry(
     callback_context.state['hallucination'] = False
 
     return llm_response
+
+
+async def matmaster_use_quota(
+    callback_context: CallbackContext,
+) -> Optional[types.Content]:
+    user_id = get_user_id(callback_context)
+    response = await use_quota_service(user_id=user_id)
+    logger.info(f'{callback_context.session.id} use_quota_service = {response}')
+    if response['code']:
+        return types.Content(parts=[Part(text=response['msg'])])

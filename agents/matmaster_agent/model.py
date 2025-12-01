@@ -1,33 +1,10 @@
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Awaitable, Callable, List, Literal, Optional, TypeAlias, Union
 
-from pydantic import BaseModel
+from google.adk.tools import BaseTool
+from pydantic import BaseModel, HttpUrl
 
-from agents.matmaster_agent.ABACUS_agent.constant import ABACUS_AGENT_NAME
-from agents.matmaster_agent.apex_agent.constant import ApexAgentName
-from agents.matmaster_agent.chembrain_agent.constant import CHEMBRAIN_AGENT_NAME
-from agents.matmaster_agent.document_parser_agent.constant import (
-    DocumentParserAgentName,
-)
-from agents.matmaster_agent.DPACalculator_agent.constant import DPACalulator_AGENT_NAME
-from agents.matmaster_agent.HEA_assistant_agent.constant import HEA_assistant_AgentName
-from agents.matmaster_agent.HEACalculator_agent.constant import HEACALCULATOR_AGENT_NAME
-from agents.matmaster_agent.INVAR_agent.constant import INVAR_AGENT_NAME
-from agents.matmaster_agent.MrDice_agent.constant import MrDice_Agent_Name
-from agents.matmaster_agent.organic_reaction_agent.constant import (
-    ORGANIC_REACTION_AGENT_NAME,
-)
-from agents.matmaster_agent.perovskite_agent.constant import PerovskiteAgentName
-from agents.matmaster_agent.piloteye_electro_agent.constant import (
-    PILOTEYE_ELECTRO_AGENT_NAME,
-)
-from agents.matmaster_agent.ssebrain_agent.constant import SSEBRAIN_AGENT_NAME
-from agents.matmaster_agent.structure_generate_agent.constant import (
-    StructureGenerateAgentName,
-)
-from agents.matmaster_agent.superconductor_agent.constant import SuperconductorAgentName
-from agents.matmaster_agent.thermoelectric_agent.constant import ThermoelectricAgentName
-from agents.matmaster_agent.traj_analysis_agent.constant import TrajAnalysisAgentName
+CostFuncType: TypeAlias = Callable[[BaseTool, dict], Awaitable[tuple[int, int]]]
 
 
 class JobStatus(str, Enum):
@@ -39,7 +16,14 @@ class JobStatus(str, Enum):
 class JobResultType(str, Enum):
     RegularFile = 'RegularFile'
     MatModelerFile = 'MatModelerFile'
+    EchartsFile = 'EchartsFile'
     Value = 'Value'
+
+
+class RenderTypeEnum(str, Enum):
+    JOB_RESULT = 'job_result'
+    LITERATURE = 'literature'
+    WEB = 'web'
 
 
 class JobResult(BaseModel):
@@ -47,6 +31,9 @@ class JobResult(BaseModel):
     data: Union[int, float, str]
     url: Optional[str] = ''
     type: JobResultType
+    meta_type: Literal[tuple(RenderTypeEnum.__members__.values())] = (
+        RenderTypeEnum.JOB_RESULT
+    )
 
 
 class BohrJobInfo(BaseModel):
@@ -72,31 +59,39 @@ class DFlowJobInfo(BaseModel):
     job_in_ctx: bool = False
 
 
+class LiteratureItem(BaseModel):
+    doi: str
+    publicationEnName: str
+    enName: str
+    enAbstract: str
+    authors: List[str]
+    coverDateStart: str
+    citationNums: int
+    good: int
+    paperUrl: Union[HttpUrl, str] = ''
+    meta_type: Literal[tuple(RenderTypeEnum.__members__.values())] = (
+        RenderTypeEnum.LITERATURE
+    )
+
+
+class WebSearchItem(BaseModel):
+    title: str
+    link: HttpUrl
+    snippet: str
+    meta_type: Literal[tuple(RenderTypeEnum.__members__.values())] = RenderTypeEnum.WEB
+
+
 class ParamsCheckComplete(BaseModel):
     flag: bool
     reason: str
     analyzed_messages: List[str]
 
 
-class MatMasterTargetAgentEnum(str, Enum):
-    ABACUSAgent = ABACUS_AGENT_NAME
-    APEXAgent = ApexAgentName
-    ChemBrainAgent = CHEMBRAIN_AGENT_NAME
-    DocumentParserAgent = DocumentParserAgentName
-    DPACalculatorAgent = DPACalulator_AGENT_NAME
-    HEAAssistantAgent = HEA_assistant_AgentName
-    HEACalculatorAgent = HEACALCULATOR_AGENT_NAME
-    INVARAgent = INVAR_AGENT_NAME
-    MrDiceAgent = MrDice_Agent_Name
-    OrganicReactionAgent = ORGANIC_REACTION_AGENT_NAME
-    PerovskiteAgent = PerovskiteAgentName
-    PiloteyeElectroAgent = PILOTEYE_ELECTRO_AGENT_NAME
-    SSEBrainAgent = SSEBRAIN_AGENT_NAME
-    StructureGenerateAgent = StructureGenerateAgentName
-    SuperConductorAgent = SuperconductorAgentName
-    ThermoElectricAgent = ThermoelectricAgentName
-    TrajAnalysisAgent = TrajAnalysisAgentName
-
-
 class UserContent(BaseModel):
     language: str
+
+
+class ToolCallInfoSchema(BaseModel):
+    tool_name: str
+    tool_args: dict
+    missing_tool_args: List[str]

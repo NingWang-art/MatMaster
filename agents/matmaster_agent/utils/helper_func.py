@@ -1,24 +1,42 @@
 import copy
 import json
 import logging
-from typing import List, Union
+import os
+import re
+from typing import Any, List, Optional, Union
 
 import jsonpickle
+from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
-from google.adk.events import Event
 from google.adk.models import LlmResponse
 from google.adk.tools import ToolContext
 from google.genai.types import Part
 from mcp.types import CallToolResult
+from pydantic import BaseModel
 from yaml.scanner import ScannerError
 
-from agents.matmaster_agent.model import JobResult, JobResultType
+from agents.matmaster_agent.constant import FRONTEND_STATE_KEY, MATMASTER_AGENT_NAME
+from agents.matmaster_agent.flow_agents.model import PlanStepStatusEnum
+from agents.matmaster_agent.logger import PrefixFilter
+from agents.matmaster_agent.model import (
+    JobResult,
+    JobResultType,
+    LiteratureItem,
+    WebSearchItem,
+)
 
 logger = logging.getLogger(__name__)
+logger.addFilter(PrefixFilter(MATMASTER_AGENT_NAME))
+logger.setLevel(logging.INFO)
 
 
 def get_session_state(ctx: Union[InvocationContext, ToolContext]):
     return ctx.session.state if isinstance(ctx, InvocationContext) else ctx.state
+
+
+def get_user_id(ctx: CallbackContext):
+    frontend_state = ctx.state.get(FRONTEND_STATE_KEY)
+    return frontend_state.get('adk_user_id') or os.getenv('BOHRIUM_USER_ID') or '1'
 
 
 def update_llm_response(
@@ -41,7 +59,9 @@ def update_llm_response(
             for index, part in enumerate(copy.deepcopy(llm_response.content.parts))
             if index in new_indices
         ]
-    logger.info(f"new_indices = {new_indices}")
+    logger.info(
+        f"[{MATMASTER_AGENT_NAME}]:[update_llm_response] new_indices = {new_indices}"
+    )
 
     return llm_response
 
@@ -54,12 +74,34 @@ def is_json(json_str):
     return True
 
 
+def is_sequence(data):
+    return isinstance(data, (tuple, list))
+
+
 async def is_float_sequence(data) -> bool:
-    return isinstance(data, (tuple, list)) and all(isinstance(x, float) for x in data)
+    return is_sequence(data) and all(isinstance(x, float) for x in data)
 
 
 async def is_str_sequence(data) -> bool:
-    return isinstance(data, (tuple, list)) and all(isinstance(x, str) for x in data)
+    return is_sequence(data) and all(isinstance(x, str) for x in data)
+
+
+def validate_model_list(data: list, model: type[BaseModel]) -> bool:
+    for item in data:
+        try:
+            model.model_validate(item)
+        except BaseException as e:
+            logger.warning(e)
+            return False
+    return True
+
+
+async def is_literature_sequence(data) -> bool:
+    return is_sequence(data) and validate_model_list(data, LiteratureItem)
+
+
+async def is_web_search_sequence(data) -> bool:
+    return is_sequence(data) and validate_model_list(data, WebSearchItem)
 
 
 async def is_matmodeler_file(filename: str) -> bool:
@@ -85,8 +127,12 @@ async def is_matmodeler_file(filename: str) -> bool:
     )
 
 
+async def is_echarts_file(filename: str) -> bool:
+    return filename.endswith('.echarts')
+
+
 async def is_image_file(filename: str) -> bool:
-    return filename.endswith(('.png', '.jpg', '.jpeg'))
+    return filename.endswith(('.png', '.jpg', '.jpeg', '.svg'))
 
 
 def flatten_dict(d, parent_key='', sep='_'):
@@ -120,20 +166,29 @@ def flatten_dict(d, parent_key='', sep='_'):
     return dict(items)
 
 
-def load_tool_response(event: Event):
-    tool_response = event.content.parts[0].function_response.response
-    if tool_response.get('result', None) is not None and isinstance(
+def is_mcp_result(tool_response: Optional[dict[str, Any]]):
+    return tool_response.get('result', None) is not None and isinstance(
         tool_response['result'], CallToolResult
-    ):
-        raw_result = (
-            event.content.parts[0].function_response.response['result'].content[0].text
-        )
+    )
+
+
+def is_algorithm_error(dict_result) -> bool:
+    return dict_result.get('code') is not None and dict_result['code'] != 0
+
+
+def load_tool_response(part: Part):
+    tool_response = part.function_response.response
+    if is_mcp_result(tool_response):
+        raw_result = tool_response['result'].content[0].text
         try:
             dict_result = jsonpickle.loads(raw_result)
         except ScannerError as err:
             raise type(err)(f"[jsonpickle ScannerError] raw_result = `{raw_result}`")
     else:
         dict_result = tool_response
+
+    if dict_result.get('status', None) == 'error':
+        raise eval(dict_result['error_type'])(dict_result['error'])
 
     return dict_result
 
@@ -179,7 +234,7 @@ async def parse_result(result: dict) -> List[dict]:
             new_result[k] = v
 
     for k, v in new_result.items():
-        if type(v) in [int, float]:
+        if type(v) in [int, float, bool]:
             parsed_result.append(
                 JobResult(name=k, data=v, type=JobResultType.Value).model_dump(
                     mode='json'
@@ -200,6 +255,15 @@ async def parse_result(result: dict) -> List[dict]:
                             name=k,
                             data=filename,
                             type=JobResultType.MatModelerFile,
+                            url=v,
+                        ).model_dump(mode='json')
+                    )
+                elif await is_echarts_file(filename):
+                    parsed_result.append(
+                        JobResult(
+                            name=k,
+                            data=filename,
+                            type=JobResultType.EchartsFile,
                             url=v,
                         ).model_dump(mode='json')
                     )
@@ -234,6 +298,12 @@ async def parse_result(result: dict) -> List[dict]:
                     type=JobResultType.Value,
                 ).model_dump(mode='json')
             )
+        elif await is_literature_sequence(v):
+            for item in v:
+                parsed_result.append(LiteratureItem(**item).model_dump(mode='json'))
+        elif await is_web_search_sequence(v):
+            for item in v:
+                parsed_result.append(WebSearchItem(**item).model_dump(mode='json'))
         else:
             parsed_result.append(
                 {
@@ -242,6 +312,22 @@ async def parse_result(result: dict) -> List[dict]:
                 }
             )
     return parsed_result
+
+
+def get_markdown_image_result(parsed_tool_result: List[JobResult]) -> List[JobResult]:
+    return [
+        item
+        for item in parsed_tool_result
+        if item.get('name') and item['name'].startswith('markdown_image')
+    ]
+
+
+def get_echarts_result(parsed_tool_result: List[JobResult]) -> List[JobResult]:
+    return [
+        item
+        for item in parsed_tool_result
+        if item.get('name') and item['type'] == JobResultType.EchartsFile
+    ]
 
 
 def is_same_function_call(
@@ -321,6 +407,29 @@ def get_new_function_call_indices(
     return new_indices
 
 
+def get_current_step_function_call(current_function_calls, ctx):
+    current_step = ctx.state['plan']['steps'][ctx.state['plan_index']]
+    current_step_tool_name, current_step_satus = (
+        current_step['tool_name'],
+        current_step['status'],
+    )
+
+    update_current_function_calls = [
+        item
+        for item in current_function_calls
+        if item['name'] == current_step_tool_name
+        and current_step_satus == PlanStepStatusEnum.PROCESS
+    ]
+
+    # if not update_current_function_calls:
+    #     logger.warning(
+    #         f'{ctx.session.id} current_function_calls empty, manual build one'
+    #     )
+    #     update_current_function_calls = [{'name': current_step_tool_name, 'args': {}}]
+
+    return update_current_function_calls
+
+
 def check_None_wrapper(func):
     def wrapper(*args, **kwargs):
         result = func(
@@ -333,3 +442,26 @@ def check_None_wrapper(func):
         return result  # 通常装饰器应该返回原函数的结果
 
     return wrapper
+
+
+def extract_json_from_string(json_string) -> str:
+    """
+    从包含JSON数据的字符串中提取JSON部分并转换为Python字典
+
+    Args:
+        json_string (str): 包含JSON数据的字符串，可能包含```json和```标记
+
+    Returns:
+        dict: 提取出的JSON数据对应的Python字典
+    """
+    # 使用正则表达式匹配```json和```之间的内容
+    pattern = r'```json\s*(.*?)\s*```'
+    match = re.search(pattern, json_string, re.DOTALL)
+
+    if match:
+        # 提取JSON字符串
+        json_content = match.group(1)
+        # 转换为Python字典
+        return json_content
+    else:
+        return json_string

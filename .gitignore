@@ -5,7 +5,7 @@ matmaster.egg-info/
 .DS_Store
 
 build/**
-.env
+.env*
 dpdispatcher.log
 dependency*
 PKG*
@@ -23,4 +23,8 @@ evalate_threads/test_adk_intergration.py
 evaluation_results.json
 output.zip
 log
+*.log
 *.csv
+*.txt
+*log*
+function_declaration

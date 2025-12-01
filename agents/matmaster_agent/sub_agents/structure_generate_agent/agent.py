@@ -1,0 +1,71 @@
+import copy
+
+from dp.agent.adapter.adk import CalculationMCPToolset
+from google.adk.agents import BaseAgent
+from google.adk.tools.mcp_tool.mcp_session_manager import SseServerParams
+
+from agents.matmaster_agent.constant import (
+    BohriumExecutor,
+    BohriumStorge,
+)
+from agents.matmaster_agent.job_agents.agent import BaseAsyncJobAgent
+from agents.matmaster_agent.llm_config import LLMConfig
+from agents.matmaster_agent.logger import matmodeler_logging_handler
+from agents.matmaster_agent.sub_agents.structure_generate_agent.prompt import (
+    StructureGenerateAgentDescription,
+    StructureGenerateAgentInstruction,
+    StructureGenerateAgentName,
+)
+
+from .constant import StructureGenerateServerUrl
+from .finance import cost_func
+
+StructureGenerateBohriumExecutor = copy.deepcopy(BohriumExecutor)
+StructureGenerateBohriumStorge = copy.deepcopy(BohriumStorge)
+StructureGenerateBohriumExecutor['machine']['remote_profile'][
+    'image_address'
+] = 'registry.dp.tech/dptech/dpa-calculator:46bc2c88'
+StructureGenerateBohriumExecutor['machine']['remote_profile'][
+    'machine_type'
+] = 'c8_m32_1 * NVIDIA 4090'
+
+sse_params = SseServerParams(url=StructureGenerateServerUrl)
+
+structure_generate_toolset = CalculationMCPToolset(
+    connection_params=sse_params,
+    storage=StructureGenerateBohriumStorge,
+    executor=StructureGenerateBohriumExecutor,
+    async_mode=True,
+    wait=False,
+    logging_callback=matmodeler_logging_handler,
+)
+
+
+class StructureGenerateAgent(BaseAsyncJobAgent):
+    def __init__(self, llm_config: LLMConfig, name_suffix=''):
+        super().__init__(
+            model=llm_config.default_litellm_model,
+            tools=[structure_generate_toolset],
+            name=StructureGenerateAgentName + name_suffix,
+            description=StructureGenerateAgentDescription,
+            instruction=StructureGenerateAgentInstruction,
+            dflow_flag=False,
+            sync_tools=[
+                'build_bulk_structure_by_template',
+                'build_bulk_structure_by_wyckoff',
+                'make_supercell_structure',
+                'make_doped_structure',
+                'make_amorphous_structure',
+                'build_molecule_structure_from_g2database',
+                'build_molecule_structures_from_smiles',
+                'add_cell_for_molecules',
+                'build_surface_adsorbate',
+                'build_surface_interface',
+                'get_structure_info',
+            ],
+            cost_func=cost_func,
+        )
+
+
+def init_structure_generate_agent(llm_config) -> BaseAgent:
+    return StructureGenerateAgent(llm_config)
