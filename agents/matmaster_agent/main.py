@@ -69,8 +69,9 @@ async def agent_main() -> None:
     # user_input = '请根据给定的空间群和 Wyckoff 位置信息生成一个晶体结构：Pm-3m空间群（编号221），a=b=c=3.90 Angstrom，α = β = γ = 90°，Sr占据1b位点(0.5, 0.5, 0.5)，Ti占据1a位点(0.0, 0.0, 0.0)，O占据3d位点(0.5, 0.0, 0.0)'
     # user_input = '先帮我构建一个FCC Bulk Cu，再用 optimize_structure 进行优化'
     # user_input = '生成一个TiO2'
-    user_input = "请帮我根据nmr的谱图，分析一下对应的分子结构h_shifts = [2.16, 2.29, 2.29, 2.29, 2.41, 2.41, 2.41, 3.58, 3.58, 5.63, 7.17, 7.17, 7.17, 7.17, 7.17, 7.17, 7.39, 7.64]c_shifts = [19.1, 19.4, 23.5, 62.7, 82.1, 84.5, 126.27, 126.3, 126.5, 127, 128.36, 128.41, 130.2, 130.8, 134.8, 135.98, 136.02, 138.9]allowed_elements = ['C', 'H', 'O', 'N']formula = 'C18H18O' topk = 5"
+    # user_input = "请帮我根据nmr的谱图，分析一下对应的分子结构h_shifts = [2.16, 2.29, 2.29, 2.29, 2.41, 2.41, 2.41, 3.58, 3.58, 5.63, 7.17, 7.17, 7.17, 7.17, 7.17, 7.17, 7.39, 7.64]c_shifts = [19.1, 19.4, 23.5, 62.7, 82.1, 84.5, 126.27, 126.3, 126.5, 127, 128.36, 128.41, 130.2, 130.8, 134.8, 135.98, 136.02, 138.9]allowed_elements = ['C', 'H', 'O', 'N']formula = 'C18H18O' topk = 5"
     # user_input = '检索DeePMD在材料计算应用方面的研究'
+    user_input = '解析这个NMR的文件，https://dp-storage-test2.oss-cn-zhangjiakou.aliyuncs.com/bohrium-test/bohrium/feedback/attachment/01KBH22RH628YHKHJS2AJ5S8KK/nmr.txt'
     print(f"🧑 用户：{user_input}")
 
     # Create the initial content with user input

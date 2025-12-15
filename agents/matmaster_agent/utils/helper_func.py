@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import os
@@ -10,20 +9,13 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.models import LlmResponse
 from google.adk.tools import ToolContext
-from google.genai.types import Part
+from google.genai.types import FunctionCall, Part
 from mcp.types import CallToolResult
-from pydantic import BaseModel
 from yaml.scanner import ScannerError
 
 from agents.matmaster_agent.constant import FRONTEND_STATE_KEY, MATMASTER_AGENT_NAME
 from agents.matmaster_agent.flow_agents.model import PlanStepStatusEnum
 from agents.matmaster_agent.logger import PrefixFilter
-from agents.matmaster_agent.model import (
-    JobResult,
-    JobResultType,
-    LiteratureItem,
-    WebSearchItem,
-)
 
 logger = logging.getLogger(__name__)
 logger.addFilter(PrefixFilter(MATMASTER_AGENT_NAME))
@@ -51,17 +43,17 @@ def update_llm_response(
         llm_response.content.parts = [
             Part(text='All Function Calls Are Occurred Before, Continue')
         ]
-    elif len(new_indices) == len(current_function_calls):
-        pass
     else:
         llm_response.content.parts = [
-            part
-            for index, part in enumerate(copy.deepcopy(llm_response.content.parts))
-            if index in new_indices
+            Part(
+                function_call=FunctionCall(
+                    id=current_function_calls[new_indices[0]]['id'],
+                    args=current_function_calls[new_indices[0]]['args'],
+                    name=current_function_calls[new_indices[0]]['name'],
+                )
+            )
         ]
-    logger.info(
-        f"[{MATMASTER_AGENT_NAME}]:[update_llm_response] new_indices = {new_indices}"
-    )
+    logger.info(f"llm_response = {llm_response}")
 
     return llm_response
 
@@ -74,106 +66,22 @@ def is_json(json_str):
     return True
 
 
-def is_sequence(data):
-    return isinstance(data, (tuple, list))
-
-
-async def is_float_sequence(data) -> bool:
-    return is_sequence(data) and all(isinstance(x, float) for x in data)
-
-
-async def is_str_sequence(data) -> bool:
-    return is_sequence(data) and all(isinstance(x, str) for x in data)
-
-
-def validate_model_list(data: list, model: type[BaseModel]) -> bool:
-    for item in data:
-        try:
-            model.model_validate(item)
-        except BaseException as e:
-            logger.warning(e)
-            return False
-    return True
-
-
-async def is_literature_sequence(data) -> bool:
-    return is_sequence(data) and validate_model_list(data, LiteratureItem)
-
-
-async def is_web_search_sequence(data) -> bool:
-    return is_sequence(data) and validate_model_list(data, WebSearchItem)
-
-
-async def is_matmodeler_file(filename: str) -> bool:
-    return (
-        filename.endswith(
-            (
-                '.cif',
-                '.poscar',
-                '.contcar',
-                '.vasp',
-                '.xyz',
-                '.mol',
-                '.mol2',
-                '.sdf',
-                '.dump',
-                '.lammpstrj',
-            )
-        )
-        or filename.startswith('lammpstrj')
-        or 'POSCAR' in filename
-        or 'CONTCAR' in filename
-        or filename == 'STRU'
-    )
-
-
-async def is_echarts_file(filename: str) -> bool:
-    return filename.endswith('.echarts')
-
-
-async def is_image_file(filename: str) -> bool:
-    return filename.endswith(('.png', '.jpg', '.jpeg', '.svg'))
-
-
-def flatten_dict(d, parent_key='', sep='_'):
-    """
-    将多层嵌套的字典拉平为一级字典
-
-    参数:
-        d: 要拉平的字典
-        parent_key: 父级键名(递归时使用)
-        sep: 嵌套键之间的分隔符
-
-    返回:
-        拉平后的一级字典
-    """
-    items = []
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
-        elif isinstance(v, list):
-            # 处理列表中的字典项
-            for i, item in enumerate(v):
-                if isinstance(item, dict):
-                    items.extend(
-                        flatten_dict(item, f"{new_key}{sep}{i}", sep=sep).items()
-                    )
-                else:
-                    items.append((f"{new_key}{sep}{i}", item))
-        else:
-            items.append((new_key, v))
-    return dict(items)
-
-
 def is_mcp_result(tool_response: Optional[dict[str, Any]]):
     return tool_response.get('result', None) is not None and isinstance(
         tool_response['result'], CallToolResult
     )
 
 
+def result_has_code(dict_result) -> bool:
+    return dict_result.get('code') is not None
+
+
 def is_algorithm_error(dict_result) -> bool:
-    return dict_result.get('code') is not None and dict_result['code'] != 0
+    return result_has_code(dict_result) and dict_result['code'] not in (0, -9999)
+
+
+def no_found_structure_error(dict_result) -> bool:
+    return result_has_code(dict_result) and dict_result['code'] == -9999
 
 
 def load_tool_response(part: Part):
@@ -191,143 +99,6 @@ def load_tool_response(part: Part):
         raise eval(dict_result['error_type'])(dict_result['error'])
 
     return dict_result
-
-
-async def parse_result(result: dict) -> List[dict]:
-    """
-    Parse and flatten a nested dictionary result into a list of standardized JobResult objects.
-
-    Processes a dictionary (potentially nested) and converts it into serialized JobResult objects.
-    Handles various data types including numbers, strings, sequences, and file URLs.
-    For image URLs, automatically generates both file reference and markdown representation.
-
-    Args:
-        result (dict): Input dictionary to parse. May contain:
-                      - Nested dictionaries (automatically flattened)
-                      - Primitive values (int, float, str)
-                      - Sequences (of numbers or strings)
-                      - URLs (regular files or MatModeler files)
-
-    Returns:
-        list: Serialized JobResult objects with appropriate types:
-              - Value: For primitive types and sequences
-              - MatModelerFile/RegularFile: For recognized file URLs
-              - Additional markdown representation for image files
-              - Error messages for unsupported types
-
-    Example:
-        >>> parse_result({"value": 42, "structure": "http://example.com/structure.cif", "phonon": "http://example.com/phonon.png"})
-
-        >>> [
-        >>>    {"name": "value", "data": 42, "type": "Value"},
-        >>>    {"name": "structure", "data": "structure.cif", "type": "MatModelerFile", "url": "http://example.com/structure.cif"},
-        >>>    {"name": "phonon", "data": "phonon.png", "type": "RegularFile", "url": "http://example.com/phonon.png"}
-        >>>    {"name": "markdown_image_phonon", "data": "![phonon.png](http://example.com/phonon.png)", "type": "Value"}
-        >>> ]
-    """
-    parsed_result = []
-    new_result = {}
-    for k, v in result.items():
-        if type(v) is dict:
-            new_result.update(**flatten_dict(v))
-        else:
-            new_result[k] = v
-
-    for k, v in new_result.items():
-        if type(v) in [int, float, bool]:
-            parsed_result.append(
-                JobResult(name=k, data=v, type=JobResultType.Value).model_dump(
-                    mode='json'
-                )
-            )
-        elif type(v) is str:
-            if not v.startswith('http'):
-                parsed_result.append(
-                    JobResult(name=k, data=v, type=JobResultType.Value).model_dump(
-                        mode='json'
-                    )
-                )
-            else:
-                filename = v.split('/')[-1]
-                if await is_matmodeler_file(filename):
-                    parsed_result.append(
-                        JobResult(
-                            name=k,
-                            data=filename,
-                            type=JobResultType.MatModelerFile,
-                            url=v,
-                        ).model_dump(mode='json')
-                    )
-                elif await is_echarts_file(filename):
-                    parsed_result.append(
-                        JobResult(
-                            name=k,
-                            data=filename,
-                            type=JobResultType.EchartsFile,
-                            url=v,
-                        ).model_dump(mode='json')
-                    )
-                else:
-                    parsed_result.append(
-                        JobResult(
-                            name=k, data=filename, type=JobResultType.RegularFile, url=v
-                        ).model_dump(mode='json')
-                    )
-                if await is_image_file(filename):
-                    # Extra Add Markdown Image
-                    parsed_result.append(
-                        JobResult(
-                            name=f"markdown_image_{k}",
-                            data=f"![{filename}]({v})",
-                            type=JobResultType.Value,
-                        ).model_dump(mode='json')
-                    )
-        elif await is_float_sequence(v):
-            parsed_result.append(
-                JobResult(
-                    name=k,
-                    data=f"{tuple([float(item) for item in v])}",
-                    type=JobResultType.Value,
-                ).model_dump(mode='json')
-            )
-        elif await is_str_sequence(v):
-            parsed_result.append(
-                JobResult(
-                    name=k,
-                    data=f"{tuple([str(item) for item in v])}",
-                    type=JobResultType.Value,
-                ).model_dump(mode='json')
-            )
-        elif await is_literature_sequence(v):
-            for item in v:
-                parsed_result.append(LiteratureItem(**item).model_dump(mode='json'))
-        elif await is_web_search_sequence(v):
-            for item in v:
-                parsed_result.append(WebSearchItem(**item).model_dump(mode='json'))
-        else:
-            parsed_result.append(
-                {
-                    'status': 'error',
-                    'msg': f"{k}({type(v)}) is not supported parse, v={v}",
-                }
-            )
-    return parsed_result
-
-
-def get_markdown_image_result(parsed_tool_result: List[JobResult]) -> List[JobResult]:
-    return [
-        item
-        for item in parsed_tool_result
-        if item.get('name') and item['name'].startswith('markdown_image')
-    ]
-
-
-def get_echarts_result(parsed_tool_result: List[JobResult]) -> List[JobResult]:
-    return [
-        item
-        for item in parsed_tool_result
-        if item.get('name') and item['type'] == JobResultType.EchartsFile
-    ]
 
 
 def is_same_function_call(
@@ -361,7 +132,7 @@ def function_calls_to_str(function_calls: List[dict]) -> str:
     for call in function_calls:
         # 确保 args 是字典或可 JSON 序列化的对象
         args_str = json.dumps(call['args'], indent=2) if call.get('args') else '{}'
-        line = f"{call['name']}({args_str})"
+        line = f"{call['name']}[{call['id']}]({args_str})"
         lines.append(line)
 
     return '\n'.join(lines)

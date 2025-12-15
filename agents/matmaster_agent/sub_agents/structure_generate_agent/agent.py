@@ -11,6 +11,9 @@ from agents.matmaster_agent.constant import (
 from agents.matmaster_agent.job_agents.agent import BaseAsyncJobAgent
 from agents.matmaster_agent.llm_config import LLMConfig
 from agents.matmaster_agent.logger import matmodeler_logging_handler
+from agents.matmaster_agent.sub_agents.structure_generate_agent.callback import (
+    regulate_savename_suffix,
+)
 from agents.matmaster_agent.sub_agents.structure_generate_agent.prompt import (
     StructureGenerateAgentDescription,
     StructureGenerateAgentInstruction,
@@ -24,12 +27,15 @@ StructureGenerateBohriumExecutor = copy.deepcopy(BohriumExecutor)
 StructureGenerateBohriumStorge = copy.deepcopy(BohriumStorge)
 StructureGenerateBohriumExecutor['machine']['remote_profile'][
     'image_address'
-] = 'registry.dp.tech/dptech/dpa-calculator:46bc2c88'
+] = 'registry.dp.tech/dptech/dpa-calculator:63ec8eda'
 StructureGenerateBohriumExecutor['machine']['remote_profile'][
     'machine_type'
 ] = 'c8_m32_1 * NVIDIA 4090'
 
-sse_params = SseServerParams(url=StructureGenerateServerUrl)
+sse_params = SseServerParams(
+    url=StructureGenerateServerUrl,
+    timeout=120,
+)
 
 structure_generate_toolset = CalculationMCPToolset(
     connection_params=sse_params,
@@ -47,6 +53,7 @@ class StructureGenerateAgent(BaseAsyncJobAgent):
             model=llm_config.default_litellm_model,
             tools=[structure_generate_toolset],
             name=StructureGenerateAgentName + name_suffix,
+            before_tool_callback=regulate_savename_suffix,
             description=StructureGenerateAgentDescription,
             instruction=StructureGenerateAgentInstruction,
             dflow_flag=False,
@@ -56,12 +63,13 @@ class StructureGenerateAgent(BaseAsyncJobAgent):
                 'make_supercell_structure',
                 'make_doped_structure',
                 'make_amorphous_structure',
-                'build_molecule_structure_from_g2database',
                 'build_molecule_structures_from_smiles',
                 'add_cell_for_molecules',
+                'build_surface_slab',
                 'build_surface_adsorbate',
                 'build_surface_interface',
                 'get_structure_info',
+                'get_molecule_info',
             ],
             cost_func=cost_func,
         )

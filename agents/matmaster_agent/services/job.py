@@ -35,6 +35,6 @@ async def check_job_create_service(ctx):
                 if res['code'] == 140202:
                     res['error'][
                         'msg'
-                    ] = 'Agent 开发者账户余额不足，需开发者充值，请稍后重试。'
+                    ] = '钱包余额不足，请在[此页面](https://www.bohrium.com/consume?menu=cash)充值后重试。'
 
                 return res

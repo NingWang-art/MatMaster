@@ -28,7 +28,6 @@ from agents.matmaster_agent.sub_agents.ScienceNavigator_agent.prompt import (
 sn_tools = [
     # "create-research-session",
     # "ask-followup-question"
-    'search-papers-normal',
     'search-papers-enhanced',
     'web-search',
 ]
@@ -64,7 +63,7 @@ class ScienceNavigatorAgent(BaseSyncAgentWithToolValidator):
             supervisor_agent=MATMASTER_AGENT_NAME,
             after_tool_callback=after_tool_callback,
             before_tool_callback=before_tool_callback,
-            render_tool_response=True,
+            render_tool_response=False,
         )
 
 

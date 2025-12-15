@@ -1,16 +1,20 @@
 import copy
+import json
 import logging
 from typing import AsyncGenerator
 
 from google.adk.agents import InvocationContext, LlmAgent
 from google.adk.events import Event
 from google.adk.models.lite_llm import LiteLlm
+from opik.integrations.adk import track_adk_agent_recursive
 from pydantic import computed_field, model_validator
 
 from agents.matmaster_agent.base_agents.disallow_transfer_agent import (
     DisallowTransferLlmAgent,
 )
-from agents.matmaster_agent.base_agents.schema_agent import SchemaAgent
+from agents.matmaster_agent.base_agents.schema_agent import (
+    SchemaAgent,
+)
 from agents.matmaster_agent.base_callbacks.private_callback import remove_function_call
 from agents.matmaster_agent.constant import MATMASTER_AGENT_NAME, ModelRole
 from agents.matmaster_agent.flow_agents.analysis_agent.prompt import (
@@ -41,7 +45,7 @@ from agents.matmaster_agent.flow_agents.plan_confirm_agent.schema import (
     PlanConfirmSchema,
 )
 from agents.matmaster_agent.flow_agents.plan_info_agent.prompt import (
-    PLAN_INFO_INSTRUCTION,
+    get_plan_info_instruction,
 )
 from agents.matmaster_agent.flow_agents.plan_make_agent.agent import PlanMakeAgent
 from agents.matmaster_agent.flow_agents.plan_make_agent.prompt import (
@@ -52,17 +56,28 @@ from agents.matmaster_agent.flow_agents.scene_agent.schema import SceneSchema
 from agents.matmaster_agent.flow_agents.schema import FlowStatusEnum, PlanSchema
 from agents.matmaster_agent.flow_agents.style import (
     all_summary_card,
-    plan_ask_confirm_card,
 )
 from agents.matmaster_agent.flow_agents.utils import (
     check_plan,
     create_dynamic_plan_schema,
     get_tools_list,
+    should_bypass_confirmation,
 )
 from agents.matmaster_agent.job_agents.agent import BaseAsyncJobAgent
 from agents.matmaster_agent.llm_config import DEFAULT_MODEL, MatMasterLlmConfig
+from agents.matmaster_agent.locales import i18n
 from agents.matmaster_agent.logger import PrefixFilter
-from agents.matmaster_agent.prompt import HUMAN_FRIENDLY_FORMAT_REQUIREMENT
+from agents.matmaster_agent.prompt import (
+    HUMAN_FRIENDLY_FORMAT_REQUIREMENT,
+)
+from agents.matmaster_agent.services.icl import (
+    expand_input_examples,
+    scene_tags_from_examples,
+    select_examples,
+    select_update_examples,
+    toolchain_from_examples,
+)
+from agents.matmaster_agent.services.questions import get_random_questions
 from agents.matmaster_agent.sub_agents.mapping import (
     AGENT_CLASS_MAPPING,
     ALL_AGENT_TOOLS_LIST,
@@ -81,6 +96,8 @@ logger.setLevel(logging.INFO)
 
 
 class MatMasterFlowAgent(LlmAgent):
+    # store example selector as a private attribute to avoid pydantic field validation
+
     @model_validator(mode='after')
     def after_init(self):
         self._chat_agent = DisallowTransferLlmAgent(
@@ -150,7 +167,7 @@ class MatMasterFlowAgent(LlmAgent):
             name='plan_info_agent',
             model=MatMasterLlmConfig.default_litellm_model,
             description='根据 materials_plan 返回的计划进行总结',
-            instruction=PLAN_INFO_INSTRUCTION,
+            # instruction=PLAN_INFO_INSTRUCTION,
         )
 
         execution_result_agent = DisallowTransferLlmAgent(
@@ -247,7 +264,7 @@ class MatMasterFlowAgent(LlmAgent):
                 for quota_remaining_event in all_text_event(
                     ctx,
                     self.name,
-                    '每日免费次数不足，请填写[问卷](https://ucoyxk075n.feishu.cn/share/base/form/shrcn8gQigMyRhSut6vSshXAeKg)申请成功后重试',
+                    i18n.t('Questionnaire'),
                     ModelRole,
                 ):
                     yield quota_remaining_event
@@ -273,17 +290,33 @@ class MatMasterFlowAgent(LlmAgent):
                     yield chat_event
             # research 模式
             else:
+                # 检索 ICL 示例
+                icl_examples = select_examples(ctx.user_content.parts[0].text, logger)
+                EXPAND_INPUT_EXAMPLES_PROMPT = expand_input_examples(icl_examples)
+                logger.info(f'{ctx.session.id} {EXPAND_INPUT_EXAMPLES_PROMPT}')
                 # 扩写用户问题
+                self.expand_agent.instruction = (
+                    EXPAND_INSTRUCTION + EXPAND_INPUT_EXAMPLES_PROMPT
+                )
                 async for expand_event in self.expand_agent.run_async(ctx):
                     yield expand_event
 
+                icl_update_examples = select_update_examples(
+                    ctx.session.state['expand']['update_user_content'], logger
+                )
+                SCENE_EXAMPLES_PROMPT = scene_tags_from_examples(icl_update_examples)
+                TOOLCHAIN_EXAMPLES_PROMPT = toolchain_from_examples(icl_update_examples)
+                logger.info(f'{ctx.session.id} {SCENE_EXAMPLES_PROMPT}')
+                logger.info(f'{ctx.session.id} {TOOLCHAIN_EXAMPLES_PROMPT}')
+
                 # 划分问题场景
+                self.scene_agent.instruction = SCENE_INSTRUCTION + SCENE_EXAMPLES_PROMPT
                 async for scene_event in self.scene_agent.run_async(ctx):
                     yield scene_event
 
                 before_scenes = ctx.session.state['scenes']
                 single_scene = ctx.session.state['single_scenes']['type']
-                scenes = list(set(before_scenes + single_scene))
+                scenes = list(set(before_scenes + single_scene + ['universal']))
                 logger.info(f'{ctx.session.id} scenes = {scenes}')
                 yield update_state_event(
                     ctx, state_delta={'scenes': copy.deepcopy(scenes)}
@@ -297,6 +330,18 @@ class MatMasterFlowAgent(LlmAgent):
                         ctx
                     ):
                         yield plan_confirm_event
+
+                    if ctx.user_content.parts[
+                        0
+                    ].text == '确认计划' and not ctx.session.state['plan_confirm'].get(
+                        'flag', False
+                    ):
+                        logger.warning(
+                            f'{ctx.session.id} 确认计划 not confirm, manually setting it'
+                        )
+                        yield update_state_event(
+                            ctx, state_delta={'plan_confirm': True}
+                        )
 
                 plan_confirm = ctx.session.state['plan_confirm'].get('flag', False)
 
@@ -323,7 +368,7 @@ class MatMasterFlowAgent(LlmAgent):
                         ]
                     )
                     self.plan_make_agent.instruction = get_plan_make_instruction(
-                        available_tools_with_info_str
+                        available_tools_with_info_str + TOOLCHAIN_EXAMPLES_PROMPT
                     )
                     self.plan_make_agent.output_schema = create_dynamic_plan_schema(
                         available_tools
@@ -332,6 +377,15 @@ class MatMasterFlowAgent(LlmAgent):
                         yield plan_event
 
                     # 总结计划
+                    plan_steps = ctx.session.state['plan'].get('steps', [])
+                    tool_names = [
+                        step.get('tool_name')
+                        for step in plan_steps
+                        if step.get('tool_name')
+                    ]
+                    self.plan_info_agent.instruction = get_plan_info_instruction(
+                        tool_names
+                    )
                     async for plan_summary_event in self.plan_info_agent.run_async(ctx):
                         yield plan_summary_event
 
@@ -347,18 +401,39 @@ class MatMasterFlowAgent(LlmAgent):
                     update_plan['steps'] = actual_steps
                     yield update_state_event(ctx, state_delta={'plan': update_plan})
 
-                    # 询问用户是否确认计划
-                    for plan_ask_confirm_event in all_text_event(
-                        ctx, self.name, plan_ask_confirm_card(), ModelRole
-                    ):
-                        yield plan_ask_confirm_event
-                    if plan_confirm:
+                    # 检查是否应该跳过用户确认步骤
+                    if should_bypass_confirmation(ctx):
+                        # 自动设置计划确认状态
                         yield update_state_event(
                             ctx,
                             state_delta={
-                                'plan_confirm': {'flag': False, 'reason': ' New Plan'}
+                                'plan_confirm': {
+                                    'flag': True,
+                                    'reason': 'Auto confirmed for single bypass tool',
+                                }
                             },
                         )
+                    else:
+                        for generate_plan_confirm_event in context_function_event(
+                            ctx,
+                            self.name,
+                            'matmaster_generate_follow_up',
+                            {},
+                            ModelRole,
+                            {
+                                'follow_up_result': json.dumps(
+                                    {
+                                        'invocation_id': ctx.invocation_id,
+                                        'title': i18n.t('PlanOperation'),
+                                        'list': [
+                                            i18n.t('ConfirmPlan'),
+                                            i18n.t('RePlan'),
+                                        ],
+                                    }
+                                ),
+                            },
+                        ):
+                            yield generate_plan_confirm_event
 
                 # 计划未确认，暂停往下执行
                 if ctx.session.state['plan_confirm']['flag']:
@@ -393,7 +468,7 @@ class MatMasterFlowAgent(LlmAgent):
                         )
                         if tool_count > 1 or is_async_agent:
                             for all_summary_event in all_text_event(
-                                ctx, self.name, all_summary_card(), ModelRole
+                                ctx, self.name, all_summary_card(i18n), ModelRole
                             ):
                                 yield all_summary_event
                             self._analysis_agent.instruction = get_analysis_instruction(
@@ -403,6 +478,25 @@ class MatMasterFlowAgent(LlmAgent):
                                 ctx
                             ):
                                 yield analysis_event
+
+                        follow_up_list = await get_random_questions(i18n=i18n)
+                        for generate_follow_up_event in context_function_event(
+                            ctx,
+                            self.name,
+                            'matmaster_generate_follow_up',
+                            {},
+                            ModelRole,
+                            {
+                                'follow_up_result': json.dumps(
+                                    {
+                                        'invocation_id': ctx.invocation_id,
+                                        'title': i18n.t('MoreQuestions'),
+                                        'list': follow_up_list,
+                                    }
+                                )
+                            },
+                        ):
+                            yield generate_follow_up_event
         except BaseException as err:
             async for error_event in send_error_event(err, ctx, self.name):
                 yield error_event
@@ -411,6 +505,10 @@ class MatMasterFlowAgent(LlmAgent):
                 name='error_handel_agent',
                 model=LiteLlm(model=DEFAULT_MODEL),
             )
+            track_adk_agent_recursive(
+                error_handel_agent, MatMasterLlmConfig.opik_tracer
+            )
+
             # 调用错误处理 Agent
             async for error_handel_event in error_handel_agent.run_async(ctx):
                 yield error_handel_event

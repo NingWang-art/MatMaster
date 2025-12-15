@@ -5,7 +5,7 @@ from google.adk.agents import InvocationContext, SequentialAgent
 from google.adk.events import Event
 from pydantic import Field, computed_field, model_validator
 
-from agents.matmaster_agent.base_agents.run_agent import (
+from agents.matmaster_agent.base_agents.recommend_summary_agent.agent import (
     BaseAgentWithRecAndSum,
 )
 from agents.matmaster_agent.base_agents.validator_agent import ValidatorAgent
@@ -64,6 +64,8 @@ class BaseAsyncJobAgent(BaseAgentWithRecAndSum):
             enable_tgz_unpack=self.enable_tgz_unpack,
             cost_func=self.cost_func,
             enforce_single_function_call=True,
+            after_tool_callback=self.after_tool_callback,
+            before_tool_callback=self.before_tool_callback,
         )
 
         submit_render_agent = SubmitRenderAgent(
@@ -96,12 +98,7 @@ class BaseAsyncJobAgent(BaseAgentWithRecAndSum):
             sub_agents=[result_core_agent],
         )
 
-        self.sub_agents = [
-            self.submit_agent,
-            self.result_agent,
-            self.recommend_params_agent,
-            self.tool_call_info_agent,
-        ]
+        self.sub_agents += [self.submit_agent, self.result_agent]
 
         return self
 

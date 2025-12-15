@@ -13,19 +13,20 @@ from agents.matmaster_agent.base_callbacks.public_callback import check_transfer
 from agents.matmaster_agent.constant import MATMASTER_AGENT_NAME, ModelRole
 from agents.matmaster_agent.flow_agents.constant import MATMASTER_SUPERVISOR_AGENT
 from agents.matmaster_agent.flow_agents.model import PlanStepStatusEnum
-from agents.matmaster_agent.flow_agents.schema import FlowStatusEnum
+from agents.matmaster_agent.flow_agents.style import step_card
 from agents.matmaster_agent.flow_agents.utils import (
     check_plan,
     get_agent_name,
 )
-from agents.matmaster_agent.job_agents.agent import BaseAsyncJobAgent
 from agents.matmaster_agent.llm_config import MatMasterLlmConfig
+from agents.matmaster_agent.locales import i18n
 from agents.matmaster_agent.logger import PrefixFilter
 from agents.matmaster_agent.prompt import MatMasterCheckTransferPrompt
 from agents.matmaster_agent.sub_agents.mapping import (
     MatMasterSubAgentsEnum,
 )
 from agents.matmaster_agent.utils.event_utils import (
+    all_text_event,
     context_function_event,
     update_state_event,
 )
@@ -44,13 +45,11 @@ class MatMasterSupervisorAgent(DisallowTransferLlmAgent):
         self.instruction = 'AgentInstruction'
         self.description = 'AgentDescription'
         self.after_model_callback = [
-            # matmaster_check_job_status,
             check_transfer(
                 prompt=MatMasterCheckTransferPrompt,
                 target_agent_enum=MatMasterSubAgentsEnum,
             ),
             MatMasterLlmConfig.opik_tracer.after_model_callback,
-            # matmaster_hallucination_retry,
         ]
 
         return self
@@ -60,12 +59,10 @@ class MatMasterSupervisorAgent(DisallowTransferLlmAgent):
         plan = ctx.session.state['plan']
         logger.info(f'{ctx.session.id} plan = {plan}')
         steps = plan['steps']
-        is_single_tool_plan = len(steps) == 1
 
         for index, step in enumerate(steps):
             if step.get('tool_name'):
                 target_agent = get_agent_name(step['tool_name'], self.sub_agents)
-                is_async_agent = isinstance(target_agent, BaseAsyncJobAgent)
                 logger.info(
                     f'{ctx.session.id} tool_name = {step['tool_name']}, target_agent = {target_agent.name}'
                 )
@@ -99,22 +96,16 @@ class MatMasterSupervisorAgent(DisallowTransferLlmAgent):
                     logger.info(
                         f'{ctx.session.id} Before Run: plan_index = {ctx.session.state["plan_index"]}, plan = {ctx.session.state['plan']}'
                     )
+                    for step_event in all_text_event(
+                        ctx, self.name, step_card(index + 1, i18n), ModelRole
+                    ):
+                        yield step_event
+
                     async for event in target_agent.run_async(ctx):
                         yield event
                     logger.info(
                         f'{ctx.session.id} After Run: plan = {ctx.session.state['plan']}, {check_plan(ctx)}'
                     )
-
-                    sync_single = is_single_tool_plan and not is_async_agent
-                    if check_plan(ctx) not in [
-                        FlowStatusEnum.NO_PLAN,
-                        FlowStatusEnum.NEW_PLAN,
-                    ] and (not sync_single or is_async_agent):
-                        # 检查之前的计划执行情况
-                        async for execution_result_event in self.sub_agents[
-                            -1
-                        ].run_async(ctx):
-                            yield execution_result_event
 
                     current_steps = ctx.session.state['plan']['steps']
                     if (

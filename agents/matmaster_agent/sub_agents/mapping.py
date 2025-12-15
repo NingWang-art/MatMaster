@@ -7,6 +7,18 @@ from agents.matmaster_agent.sub_agents.ABACUS_agent.agent import (
 from agents.matmaster_agent.sub_agents.ABACUS_agent.constant import ABACUS_AGENT_NAME
 from agents.matmaster_agent.sub_agents.apex_agent.agent import ApexAgent, apex_toolset
 from agents.matmaster_agent.sub_agents.apex_agent.constant import ApexAgentName
+from agents.matmaster_agent.sub_agents.built_in_agent.file_parse_agent.agent import (
+    FileParseAgent,
+)
+from agents.matmaster_agent.sub_agents.built_in_agent.file_parse_agent.constant import (
+    FILE_PARSE_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.built_in_agent.llm_tool_agent.agent import (
+    LLMToolAgent,
+)
+from agents.matmaster_agent.sub_agents.built_in_agent.llm_tool_agent.constant import (
+    TOOL_AGENT_NAME,
+)
 from agents.matmaster_agent.sub_agents.chembrain_agent.agent import ChemBrainAgent
 from agents.matmaster_agent.sub_agents.chembrain_agent.constant import (
     CHEMBRAIN_AGENT_NAME,
@@ -18,7 +30,11 @@ from agents.matmaster_agent.sub_agents.chembrain_agent.smiles_conversion_agent.a
     smiles_conversion_toolset,
 )
 from agents.matmaster_agent.sub_agents.chembrain_agent.unielf_agent.agent import (
-    uni_elf_toolset,
+    UniELFAgent,
+    unielf_toolset,
+)
+from agents.matmaster_agent.sub_agents.chembrain_agent.unielf_agent.constant import (
+    UniELFAgentName,
 )
 from agents.matmaster_agent.sub_agents.CompDART_agent.agent import (
     CompDARTAgent,
@@ -41,12 +57,26 @@ from agents.matmaster_agent.sub_agents.document_parser_agent.agent import (
 from agents.matmaster_agent.sub_agents.document_parser_agent.constant import (
     DocumentParserAgentName,
 )
+from agents.matmaster_agent.sub_agents.doe_agent.agent import (
+    DoEAgent,
+    doe_toolset,
+)
+from agents.matmaster_agent.sub_agents.doe_agent.constant import (
+    DOE_AGENT_NAME,
+)
 from agents.matmaster_agent.sub_agents.DPACalculator_agent.agent import (
     DPACalculationsAgent,
     dpa_toolset,
 )
 from agents.matmaster_agent.sub_agents.DPACalculator_agent.constant import (
     DPACalulator_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.Electron_Microscope_agent.agent import (
+    ElectronMicroscopeAgent,
+    electron_microscope_toolset,
+)
+from agents.matmaster_agent.sub_agents.Electron_Microscope_agent.constant import (
+    Electron_Microscope_AGENT_NAME,
 )
 from agents.matmaster_agent.sub_agents.finetune_dpa_agent.agent import (
     FinetuneDPAAgent,
@@ -68,6 +98,13 @@ from agents.matmaster_agent.sub_agents.HEACalculator_agent.agent import (
 )
 from agents.matmaster_agent.sub_agents.HEACalculator_agent.constant import (
     HEACALCULATOR_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.HEAkb_agent.agent import (
+    HEAKbAgent,
+    hea_kb_toolset,
+)
+from agents.matmaster_agent.sub_agents.HEAkb_agent.constant import (
+    HEA_KB_AGENT_NAME,
 )
 from agents.matmaster_agent.sub_agents.LAMMPS_agent.agent import (
     LAMMPSAgent,
@@ -123,12 +160,26 @@ from agents.matmaster_agent.sub_agents.perovskite_agent.agent import (
 from agents.matmaster_agent.sub_agents.perovskite_agent.constant import (
     PerovskiteAgentName,
 )
+from agents.matmaster_agent.sub_agents.Physical_adsorption_agent.agent import (
+    PhysicalAdsorptionAgent,
+    physical_adsorption_toolset,
+)
+from agents.matmaster_agent.sub_agents.Physical_adsorption_agent.constant import (
+    Physical_Adsorption_AGENT_NAME,
+)
 from agents.matmaster_agent.sub_agents.piloteye_electro_agent.agent import (
     PiloteyeElectroAgent,
     piloteye_electro_toolset,
 )
 from agents.matmaster_agent.sub_agents.piloteye_electro_agent.constant import (
     PILOTEYE_ELECTRO_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.POLYMERkb_agent.agent import (
+    POLYMERKbAgent,
+    polymer_kb_toolset,
+)
+from agents.matmaster_agent.sub_agents.POLYMERkb_agent.constant import (
+    POLYMER_KB_AGENT_NAME,
 )
 from agents.matmaster_agent.sub_agents.ScienceNavigator_agent.agent import (
     ScienceNavigatorAgent,
@@ -140,6 +191,27 @@ from agents.matmaster_agent.sub_agents.ScienceNavigator_agent.constant import (
 from agents.matmaster_agent.sub_agents.ssebrain_agent.agent import SSEBrainAgent
 from agents.matmaster_agent.sub_agents.ssebrain_agent.constant import (
     SSEBRAIN_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.SSEkb_agent.agent import (
+    SSEKbAgent,
+    sse_kb_toolset,
+)
+from agents.matmaster_agent.sub_agents.SSEkb_agent.constant import (
+    SSE_KB_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.STEEL_PREDICT_agent.agent import (
+    STEELPredictAgent,
+    steel_predict_toolset,
+)
+from agents.matmaster_agent.sub_agents.STEEL_PREDICT_agent.constant import (
+    STEEL_PREDICT_AGENT_NAME,
+)
+from agents.matmaster_agent.sub_agents.STEELkb_agent.agent import (
+    STEELKbAgent,
+    steel_kb_toolset,
+)
+from agents.matmaster_agent.sub_agents.STEELkb_agent.constant import (
+    STEEL_KB_AGENT_NAME,
 )
 from agents.matmaster_agent.sub_agents.structure_generate_agent.agent import (
     StructureGenerateAgent,
@@ -203,13 +275,19 @@ ALL_TOOLSET_DICT = {
     'apex_toolset': apex_toolset,
     'smiles_conversion_toolset': smiles_conversion_toolset,
     'retrosyn_toolset': retrosyn_toolset,
-    'uni_elf_toolset': uni_elf_toolset,
+    'unielf_toolset': unielf_toolset,
     'compdart_toolset': compdart_toolset,
+    'doe_toolset': doe_toolset,
     'document_parser_toolset': document_parser_toolset,
     'dpa_toolset': dpa_toolset,
     'finetune_dpa_toolset': finetune_dpa_toolset,
     'hea_assistant_toolset': hea_assistant_toolset,
     'hea_calculator_toolset': hea_calculator_toolset,
+    'hea_kb_toolset': hea_kb_toolset,
+    'sse_kb_toolset': sse_kb_toolset,
+    'polymer_kb_toolset': polymer_kb_toolset,
+    'steel_kb_toolset': steel_kb_toolset,
+    'steel_predict_toolset': steel_predict_toolset,
     'optimade_toolset': optimade_toolset,
     'bohriumpublic_toolset': bohriumpublic_toolset,
     'openlam_toolset': openlam_toolset,
@@ -228,6 +306,8 @@ ALL_TOOLSET_DICT = {
     'convexhull_toolset': convexhull_toolset,
     'nmr_toolset': nmr_toolset,
     'xrd_toolset': xrd_toolset,
+    'electron_microscope_toolset': electron_microscope_toolset,
+    'physical_adsorption_toolset': physical_adsorption_toolset,
 }
 
 AGENT_CLASS_MAPPING = {
@@ -235,11 +315,17 @@ AGENT_CLASS_MAPPING = {
     ApexAgentName: ApexAgent,
     CHEMBRAIN_AGENT_NAME: ChemBrainAgent,
     COMPDART_AGENT_NAME: CompDARTAgent,
+    DOE_AGENT_NAME: DoEAgent,
     DocumentParserAgentName: DocumentParserAgentBase,
     DPACalulator_AGENT_NAME: DPACalculationsAgent,
     FinetuneDPAAgentName: FinetuneDPAAgent,
     HEA_assistant_AgentName: HEA_assistant_AgentBase,
     HEACALCULATOR_AGENT_NAME: HEACalculatorAgentBase,
+    HEA_KB_AGENT_NAME: HEAKbAgent,
+    SSE_KB_AGENT_NAME: SSEKbAgent,
+    POLYMER_KB_AGENT_NAME: POLYMERKbAgent,
+    STEEL_KB_AGENT_NAME: STEELKbAgent,
+    STEEL_PREDICT_AGENT_NAME: STEELPredictAgent,
     LAMMPS_AGENT_NAME: LAMMPSAgent,
     OPTIMADE_DATABASE_AGENT_NAME: Optimade_AgentBase,
     BOHRIUMPUBLIC_DATABASE_AGENT_NAME: Bohriumpublic_AgentBase,
@@ -260,6 +346,11 @@ AGENT_CLASS_MAPPING = {
     ConvexHullAgentName: ConvexHullAgent,
     NMR_AGENT_NAME: NMRAgent,
     XRD_AGENT_NAME: XRDAgent,
+    Electron_Microscope_AGENT_NAME: ElectronMicroscopeAgent,
+    TOOL_AGENT_NAME: LLMToolAgent,
+    Physical_Adsorption_AGENT_NAME: PhysicalAdsorptionAgent,
+    FILE_PARSE_AGENT_NAME: FileParseAgent,
+    UniELFAgentName: UniELFAgent,
 }
 
 
@@ -271,6 +362,11 @@ class MatMasterSubAgentsEnum(str, Enum):
     DPACalculatorAgent = DPACalulator_AGENT_NAME
     HEAAssistantAgent = HEA_assistant_AgentName
     HEACalculatorAgent = HEACALCULATOR_AGENT_NAME
+    HEAKbAgent = HEA_KB_AGENT_NAME
+    SSEKbAgent = SSE_KB_AGENT_NAME
+    POLYMERKbAgent = POLYMER_KB_AGENT_NAME
+    STEELKbAgent = STEEL_KB_AGENT_NAME
+    STEELPredictAgent = STEEL_PREDICT_AGENT_NAME
     LAMMPSAgent = LAMMPS_AGENT_NAME
     CompDARTAgent = COMPDART_AGENT_NAME
     OptimadeDatabaseAgent = OPTIMADE_DATABASE_AGENT_NAME
@@ -293,6 +389,11 @@ class MatMasterSubAgentsEnum(str, Enum):
     ConvexHullAgent = ConvexHullAgentName
     NMRAgent = NMR_AGENT_NAME
     XRDAgent = XRD_AGENT_NAME
+    ElectronMicroscopeAgent = Electron_Microscope_AGENT_NAME
+    ToolAgent = TOOL_AGENT_NAME
+    FileParseAgent = FILE_PARSE_AGENT_NAME
+    PhysicalAdsorptionAgent = Physical_Adsorption_AGENT_NAME
+    UniELFAgentNameEnum = UniELFAgentName
 
 
 ALL_AGENT_TOOLS_LIST = list(ALL_TOOLS.keys())

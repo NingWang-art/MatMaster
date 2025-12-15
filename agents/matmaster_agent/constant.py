@@ -48,6 +48,7 @@ GOODS_API_BASE = f'https://goods-server{URL_PART}.dp.tech'
 FINANCE_API_BASE = f'https://finance-web{URL_PART}.dp.tech'
 BOHRIUM_COM = f'https://www{URL_PART}.bohrium.com'
 BOHRIUM_HOST = f'https://bohrium{URL_PART}.dp.tech'
+ICL_SERVICE_URL = '101.126.90.82:8001'
 MATMASTER_TOOLS_SERVER = f'https://matmaster-tools-server{URL_PART}.bohrium.com'
 if CURRENT_ENV == 'test':
     DFLOW_HOST = 'https://lbg-workflow-mlops.test.dp.tech'
@@ -81,6 +82,8 @@ MATERIALS_ORG_ID = int(os.getenv('MATERIALS_ORG_ID', -1))
 MATERIALS_ACCESS_KEY = str(os.getenv('MATERIALS_ACCESS_KEY', ''))
 MATERIALS_PROJECT_ID = int(os.getenv('MATERIALS_PROJECT_ID', -1))
 MATMASTER_SKU_ID = int(os.getenv('MATMASTER_SKU_ID', -1))
+BOHRIUM_ACCESS_KEY = str(os.getenv('BOHRIUM_ACCESS_KEY', ''))
+BOHRIUM_PROJECT_ID = int(os.getenv('BOHRIUM_PROJECT_ID', -1))
 
 # Constant-SKU
 SKU_MAPPING = {'matmaster': MATMASTER_SKU_ID}
